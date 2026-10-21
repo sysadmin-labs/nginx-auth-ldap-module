@@ -51,6 +51,11 @@ jobs:
             ci/auth.sh "$HOME/nginx/sbin/nginx"
           # valgrind writes a summary whether or not it found anything, so
           # its absence means valgrind did not run and the gate is blind
+          # The log goes out before anything is judged on it: a verdict
+          # that exits first takes the evidence with it.
+          sed -n '1,400p' vg-auth.log
+          cat vg-auth.log >> valgrind.log
+
           grep -q "ERROR SUMMARY" vg-auth.log || {
             echo "valgrind wrote no summary, so it did not run" >&2
             exit 1
@@ -58,12 +63,9 @@ jobs:
           # And the summary is the verdict: counting on a list of phrases
           # lets through every kind of finding that is not on the list.
           grep -q "ERROR SUMMARY: 0 errors" vg-auth.log || {
-            echo "valgrind counted findings of its own:" >&2
-            grep -E "ERROR SUMMARY|lost: " vg-auth.log >&2
+            echo "valgrind counted findings of its own, see the log above" >&2
             exit 1
           }
-          sed -n '1,200p' vg-auth.log
-          cat vg-auth.log >> valgrind.log
 
       - name: No findings allowed
         run: |
