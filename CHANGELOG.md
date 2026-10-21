@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.2.0 (2026-10-21)
+## v0.1.0 (2026-10-21)
 
 First release of this fork, from upstream `241200e`.
 
@@ -70,9 +70,6 @@ First release of this fork, from upstream `241200e`.
   the client saw nothing at all.  A directory that cannot be reached -- one
   whose certificate is refused, for instance -- left the request waiting out
   its `request_timeout` and then dropped it.  It is a 500 now.
-- A bind DN that `require valid_user "<dn>"` builds from a variable is
-  refused when the variable adds a relative name of its own, and the value of
-  the first relative name of a group is escaped before it goes into a filter.
 - Over `ldaps://`: a certificate whose name does not match crashed the worker
   (nginx leaves `sockaddr` unset on a connection it dialled out, and the
   address fallback read it), the certificate was never freed, the error
@@ -88,12 +85,54 @@ First release of this fork, from upstream `241200e`.
 - A connection given back to the pool twice was linked to itself, and a walk
   over the pool then had no end.  Giving it back twice is now a no-op, the
   way taking it out twice already was.
+- A connection that was closed while a request held it went back into the
+  pool all the same: closing cleared its own pointer to the request but not
+  the request's pointer to it, so the request handed back a connection that
+  was gone and the next one bound on a handle of NULL.  Closing now clears
+  both, and only a connection that is ready and still has its handle goes
+  back in.
+- The retry after `LDAP_SERVER_DOWN` called the reconnect handler with the
+  read event of the nginx connection that closing had just given back, so
+  the handler read the LDAP connection out of a slot the free list had
+  already taken over.  It arms the reconnect timer instead.
+- `max_down_retries_count` sat in front of the field the cache key stops at,
+  so a directory that dropped a connection changed the key of a server whose
+  configuration had not changed.  It is behind that field now, where the
+  other fields that change while the worker runs are.
+- The cache was read for every server of a location, including the ones this
+  request had already been refused by: a pass cached for such a server in
+  the meantime overrode the refusal this request had just had from it.  The
+  lookup starts at the server that is about to decide.
+- An error from the bind fell through to the rebind phase, where there was
+  nothing to undo, instead of moving on to the next server.
+- The comma that separates the relative names of a group was looked for with
+  `ngx_strchr()`, which finds one that a backslash makes part of a value:
+  `cn=Admins\,Global,ou=groups,dc=x` became an assertion on `cn=Admins\` and
+  a search under `Global,ou=groups,dc=x` (issue 224, DreDub2k).  The count that holds a
+  rule against its template reads a name the same way, so the two cannot
+  disagree.
+- A rule counted as ending in a variable when its last character closed a
+  brace, whatever that brace belonged to, and the looser rule that goes with
+  a variable at the end was then applied to a rule with a variable in the
+  middle as well.  It now takes exactly one variable, at the end, and nothing
+  behind it.
+- A url that names no host, which RFC 4516 allows, was read as a string
+  while the configuration was parsed: the master process went down on
+  `nginx -t`.
+- `ngx_palloc()` for the url and `ngx_pcalloc()` for a group rule went
+  unchecked into `ngx_sprintf()` and `ngx_memcpy()`.
 
 ### Changed
 
-- Authorities named with `ssl_ca_file` or `ssl_ca_dir` take the place of the
-  trust store of the system instead of being added to it.  A configuration
-  that says which authority signs its directory means that one.
+- Every `ldap_server` that verifies a certificate gets a trust store of its
+  own, holding the authorities it names and nothing else, or the trust store
+  of the system where it names none.  The authorities used to go into the
+  SSL context, which belongs to the configuration and is shared by every
+  server in it: one server's authority was trusted by all of them, and a
+  server that named none put the store of the system back behind the ones
+  that had been named.  Authorities that cannot be loaded now fail the
+  configuration instead of leaving a server that trusts whatever is in the
+  store of the system.
 
 ### Added
 
@@ -118,13 +157,14 @@ First release of this fork, from upstream `241200e`.
   over here).
 - Revocation of the certificate of a directory is not checked, and there is
   no way to ask for it.
-- `max_down_retries` counts on the server rather than on the connection, so
-  with more than one connection they all count into the same number and one
-  that comes back resets it for the others.  Issue 226 is about what that
-  setting does in practice.
 - `ssl_check_cert` is a flag: there is no way to verify the chain and leave
   the name alone, which pull requests 237 and 251 both propose as a third
   setting.
+- `max_down_retries` is counted for the server and not for the connection,
+  so with more than one connection they count into the same number; and a
+  connection that comes back resets it, so a directory that goes down and
+  comes back repeatedly is retried again every time (issue 226).  What this
+  release moved is only where the number is kept.
 - The name of a certificate may be taken from its common name where the
   certificate carries no subject alternative name.  RFC 9525 says it should
   not be, and issue 254 asks for that; nginx's own check does the same, and

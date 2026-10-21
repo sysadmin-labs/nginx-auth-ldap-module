@@ -36,7 +36,7 @@ HTTP basic authentication against an LDAP directory: `auth_ldap` with server
 blocks, group requirements, a connection pool and an answer cache.
 
 A maintained fork of `kvspb/nginx-auth-ldap`, whose code upstream last
-changed in December 2023.  What this fork fixes, and what it does not, is in
+changed in April 2024.  What this fork fixes, and what it does not, is in
 the [changelog](CHANGELOG.md).
 
 ## Synopsis
@@ -96,7 +96,7 @@ Inside the block:
 | `reconnect_timeout` | how long a connection that was lost waits before it is made again, 10s |
 | `max_down_retries` | how often a connection that the directory dropped is rebuilt right away instead of waiting out `reconnect_timeout`, 0 by default |
 | `referral` | `on` by default; `off` makes a referral an error instead of a redirection |
-| `ssl_check_cert`, `ssl_ca_file`, `ssl_ca_dir` | for `ldaps://`: whether the certificate of the directory is verified, `off` by default and only `on` is read, and which authorities are trusted.  Named authorities take the place of the trust store of the system rather than adding to it.  A certificate is accepted when its chain verifies and it names the host the url names, or the address the connection was made to; the name may come from the common name where there is no subject alternative name, as in nginx's own check, a partial wildcard is refused, and revocation is not checked. |
+| `ssl_check_cert`, `ssl_ca_file`, `ssl_ca_dir` | for `ldaps://`: whether the certificate of the directory is verified, `off` by default and only `on` is read, and which authorities are trusted.  Each block gets a store of its own, holding the authorities it names and nothing else, or the trust store of the system where it names none; one that cannot be loaded fails the configuration.  A certificate is accepted when its chain verifies and it names the host the url names, or the address the connection was made to; the name may come from the common name where there is no subject alternative name, as in nginx's own check, a partial wildcard is refused, and revocation is not checked. |
 | `include` | reads a file into the block, for the password that does not belong in the main configuration |
 
 ### `auth_ldap`
@@ -139,8 +139,9 @@ The cache holds the hash of the credentials, not the credentials.
 **context:** `http`
 
 How many outcomes the cache holds.  The value is a size, so `1k` means 1024
-of them.  Fewer than 100 is refused when the configuration is read, as is an
-expiration below one second.
+of them.  With the cache switched on, fewer than 100 is refused when the
+configuration is read, as is an expiration below one second; with it
+switched off neither is looked at.
 
 ### `auth_ldap_servers_size`
 
@@ -148,9 +149,11 @@ expiration below one second.
 **default:** `7`
 **context:** `http`
 
-The number sizes the array the blocks go into.  More of them work as long as
-every `ldap_server` block stands before the first `auth_ldap_servers`: the
-array moves when it grows, and a location holds pointers into it.
+The number sizes the array the blocks go into, and it is read when the first
+`ldap_server` block creates that array: set after that block, it does
+nothing at all.  More blocks than the number work as long as every one of
+them stands before the first `auth_ldap_servers`: the array moves when it
+grows, and a location holds pointers into it.
 
 ## Behaviour
 
@@ -177,10 +180,8 @@ usable connection at all, so a request through it waits out its
 The handler runs in the access phase, so a refused request never reaches the
 content phase.  Every worker keeps its own connections, made when it starts
 and closed when it leaves, and a request that finds them all busy waits for
-one to come free rather than opening another.
-
-With `connections` left at its default of one, every request through a block
-waits behind the request before it.
+one to come free rather than opening another -- with `connections` at its
+default of one, that means behind the request before it.
 
 ## Building
 
@@ -235,6 +236,7 @@ by onovy (pull request 239), the handling of a connect that has already
 completed by NuLL3rr0r (617), the terminated header list together with the
 freeing of the parsed url by freultwah (250) and the header list again by
 jessp01 (252, 253), the address the certificate of the directory is held
-against by mmguero (237) and Ericbla (251), and the lookup of the cache for
-every server of a location, whose consequences are fixed here, by landryb
-(219).
+against by mmguero (237), who also reported the crash it caused (issue 236),
+and by Ericbla (251), the comma a backslash makes part of a group name by
+DreDub2k (issue 224), and the lookup of the cache for every server of a
+location, whose consequences are fixed here, by landryb (219).
