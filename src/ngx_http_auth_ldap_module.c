@@ -212,6 +212,7 @@ static char * ngx_http_auth_ldap_parse_url(ngx_conf_t *cf, ngx_http_auth_ldap_se
 static char * ngx_http_auth_ldap_parse_require(ngx_conf_t *cf, ngx_http_auth_ldap_server_t *server);
 static char * ngx_http_auth_ldap_parse_satisfy(ngx_conf_t *cf, ngx_http_auth_ldap_server_t *server);
 static char * ngx_http_auth_ldap_parse_referral(ngx_conf_t *cf, ngx_http_auth_ldap_server_t *server);
+static void ngx_http_auth_ldap_free_urldesc(void *data);
 static ngx_int_t ngx_http_auth_ldap_escape_filter(ngx_http_request_t *r,
     ngx_str_t *in, ngx_str_t *out);
 static void * ngx_http_auth_ldap_create_main_conf(ngx_conf_t *cf);
@@ -559,6 +560,21 @@ ngx_http_auth_ldap_servers(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 }
 
 /**
+ * Give back what ldap_url_parse() took.
+ *
+ * It belongs to the library, not to a pool, so it is tied to the cycle the
+ * configuration was read into: on a reload the old cycle goes away and this
+ * runs, and on a shutdown it runs too.  Without it every reload left the
+ * parsed url of every ldap_server behind in the master, for the life of the
+ * process.
+ */
+static void
+ngx_http_auth_ldap_free_urldesc(void *data)
+{
+    ldap_free_urldesc((LDAPURLDesc *) data);
+}
+
+/**
  * Parse URL conf parameter
  */
 static char *
@@ -566,6 +582,7 @@ ngx_http_auth_ldap_parse_url(ngx_conf_t *cf, ngx_http_auth_ldap_server_t *server
 {
     ngx_str_t *value;
     u_char *p;
+    ngx_pool_cleanup_t *cln;
 
     value = cf->args->elts;
 
@@ -614,6 +631,16 @@ ngx_http_auth_ldap_parse_url(ngx_conf_t *cf, ngx_http_auth_ldap_server_t *server
         }
         return NGX_CONF_ERROR;
     }
+
+    cln = ngx_pool_cleanup_add(cf->pool, 0);
+    if (cln == NULL) {
+        ldap_free_urldesc(server->ludpp);
+        server->ludpp = NULL;
+        return NGX_CONF_ERROR;
+    }
+
+    cln->handler = ngx_http_auth_ldap_free_urldesc;
+    cln->data = server->ludpp;
 
     if (server->ludpp->lud_attrs == NULL) {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "http_auth_ldap: No user attribute specified in auth_ldap_url.");
