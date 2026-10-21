@@ -34,8 +34,15 @@ if [ "${1:-}" = stop ]; then
 	exit 0
 fi
 
-slapd=$(command -v slapd || echo /usr/sbin/slapd)
-[ -x "$slapd" ] || { echo "slapd(8) is needed" >&2; exit 2; }
+# FreeBSD's openldap26-server puts slapd in libexec and not on the path,
+# which is also where a slapd built from source usually ends up.
+slapd=$(command -v slapd 2> /dev/null || true)
+if [ -z "$slapd" ]; then
+	for s in /usr/local/libexec/slapd /usr/sbin/slapd /usr/libexec/slapd; do
+		[ -x "$s" ] && { slapd=$s; break; }
+	done
+fi
+[ -n "$slapd" ] && [ -x "$slapd" ] || { echo "slapd(8) is needed" >&2; exit 2; }
 command -v ldapadd > /dev/null || { echo "ldapadd(1) is needed" >&2; exit 2; }
 command -v ldapsearch > /dev/null || { echo "ldapsearch(1) is needed" >&2; exit 2; }
 
