@@ -15,6 +15,18 @@
 # shipped stable line no longer carries it.
 nonnull-attribute:ngx_pstrdup
 
+# nginx's own MD5 reads its input four bytes at a time out of a buffer that
+# is aligned to one.  That is deliberate: ngx_md5.c takes the unaligned path
+# where NGX_HAVE_NONALIGNED says the platform allows it, and x86 does.  The
+# module reaches it by hashing a cache key, so the buffer is nginx's and the
+# code is nginx's:
+#
+#     #0 ngx_md5_body   src/core/ngx_md5.c:194
+#     #1 ngx_md5_update src/core/ngx_md5.c:36
+#
+# Nothing the module could do changes it, short of not using nginx's MD5.
+alignment:ngx_md5_body
+
 # Only clang's UBSan reads this file; the libubsan of gcc has no
 # suppressions option at all.  The workflow therefore filters the same
 # finding out of its verdict by hand, and this file stays the one place that

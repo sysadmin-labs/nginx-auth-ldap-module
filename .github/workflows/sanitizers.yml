@@ -25,9 +25,10 @@ jobs:
       # and every feature probe comes out "found but is not working".  So
       # leaks are valgrind's job here, not this job's.
       ASAN_OPTIONS: detect_leaks=0
-      # The suppression file names one finding in nginx's own startup
-      # path and says why; see ci/ubsan.suppress.  The path has to be
-      # absolute, the suite runs nginx from a directory of its own.
+      # ci/ubsan.suppress says which finding is nginx's own and why.  gcc's
+      # libubsan cannot read a suppression file, so the verdict step below
+      # takes that one finding out instead; the option is set for a clang
+      # build, where it works.
       UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=0:suppressions=${{ github.workspace }}/ci/ubsan.suppress
       CI_CC_OPT: '-fsanitize=address,undefined -fno-omit-frame-pointer -g -O1'
       CI_LD_OPT: '-fsanitize=address,undefined'
@@ -52,27 +53,35 @@ jobs:
             TEST_NGINX_BINARY="$HOME/nginx/sbin/nginx" \
             prove -r t/ 2>&1 | tee sanitizer.log
 
-      - name: Run the driver under the sanitizers
+      - name: Run the drivers under the sanitizers
         run: |
           set -o pipefail
-          # t/ only reaches the configuration parser.  This is the part that
-          # walks the module at run time, which is what the sanitizers are
-          # here for.
-          ASAN_OPTIONS="$ASAN_OPTIONS:abort_on_error=0" \
+          # t/ only reaches the configuration parser.  These are the parts
+          # that walk the module at run time, which is what the sanitizers
+          # are here for.  Leak detection is on here and not for the build:
+          # it is nginx's configure probes that cannot live with it.
+          ASAN_OPTIONS="detect_leaks=1:abort_on_error=0" \
             AUTH_LOG_LEVEL=info ci/auth.sh "$HOME/nginx/sbin/nginx" 2>&1 |
             tee -a sanitizer.log
           # nginx writes what the sanitizers say into its own error log, not
           # to the pipe above, so that log belongs in the verdict as well
           cat ci-work/auth/logs/error.log >> sanitizer.log
+          ASAN_OPTIONS="detect_leaks=1:abort_on_error=0" \
+            ci/ldaps.sh "$HOME/nginx/sbin/nginx" 2>&1 | tee -a sanitizer.log
+          cat ci-work/ldaps/logs/error.log >> sanitizer.log
 
       - name: No findings allowed
         run: |
           # ngx_pstrdup copies a null prefix of length zero while nginx
           # starts, before a module is loaded; ci/ubsan.suppress says why
           # that is nginx's and not ours.  gcc's libubsan cannot read a
-          # suppression file, so the one finding is taken out here.
-          grep -nE "AddressSanitizer|runtime error:" sanitizer.log |
-            grep -v 'src/core/ngx_string.c:84' > findings.txt || true
+          # suppression file, so the one finding is taken out here -- by the
+          # whole line it prints, not by the file and line alone, so that a
+          # finding of ours that lands on the same nginx line stays in.
+          grep -nE "AddressSanitizer|LeakSanitizer|runtime error:" sanitizer.log |
+            grep -vE "ngx_string\.c:[0-9]+:[0-9]+: runtime error: null pointer passed as argument 2, which is declared to never be null" |
+            grep -vE "ngx_md5\.c:[0-9]+:[0-9]+: runtime error: load of misaligned address .* for type 'uint32_t'" \
+            > findings.txt || true
 
           if [ -s findings.txt ]; then
             cat findings.txt >&2

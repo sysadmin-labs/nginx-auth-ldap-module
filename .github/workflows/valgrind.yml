@@ -36,17 +36,35 @@ jobs:
       - name: Run the test suite under valgrind
         run: |
           set -o pipefail
+          # Test::Nginx runs valgrind with -q, so a clean run says nothing
+          # at all and cannot be told apart from a run that never happened.
+          # The step below is the one that proves valgrind was there.
           TEST_NGINX_USE_VALGRIND=1 TEST_NGINX_NO_SHUFFLE=1 \
             TEST_NGINX_BINARY="$HOME/nginx/sbin/nginx" \
             prove -r t/ 2>&1 | tee valgrind.log
-          # A clean run says nothing at all, which looks exactly like a run
-          # that never happened.  So ask valgrind itself whether it was
-          # there, with a binary it has to refuse to run.
-          valgrind --version | tee -a valgrind.log
+
+      - name: Run the driver under valgrind
+        run: |
+          # t/ reaches the configuration parser; this walks a request
+          # through the module, which is where a leak per request would be.
+          AUTH_WRAP="valgrind --leak-check=full --show-leak-kinds=definite,indirect --num-callers=30 --error-exitcode=0 --suppressions=$PWD/ci/valgrind.suppress --log-file=$PWD/vg-auth.log" \
+            ci/auth.sh "$HOME/nginx/sbin/nginx"
+          # valgrind writes a summary whether or not it found anything, so
+          # its absence means valgrind did not run and the gate is blind
+          grep -q "ERROR SUMMARY" vg-auth.log || {
+            echo "valgrind wrote no summary, so it did not run" >&2
+            exit 1
+          }
+          sed -n '1,200p' vg-auth.log
+          cat vg-auth.log >> valgrind.log
 
       - name: No findings allowed
         run: |
-          if grep -niE "invalid read|invalid write|definitely lost|indirectly lost|uninitialised|uninitialized value|conditional jump|mismatched free" valgrind.log; then
+          # "are definitely lost" is how a loss record reads; the summary at
+          # the end of a run says "definitely lost: 0 bytes", so matching the
+          # words alone would turn a clean run red.
+          if grep -niE "invalid read|invalid write|uninitialised|uninitialized value|conditional jump|mismatched free" valgrind.log ||
+             grep -nE "are (definitely|indirectly) lost" valgrind.log; then
             echo "valgrind reported the lines above" >&2
             exit 1
           fi
