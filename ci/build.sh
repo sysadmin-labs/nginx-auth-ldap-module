@@ -71,6 +71,15 @@ esac
 
 cd "$WORK/nginx-$NGINX"
 
+# On FreeBSD the OpenLDAP client comes from the ports tree and lands under
+# /usr/local, which the compiler does not search by itself.  The README says
+# to point at it with these two flags, so this does, and a build there needs
+# nothing from the caller.
+if [ "$(uname -s)" = FreeBSD ]; then
+	CI_CC_OPT="${CI_CC_OPT:+$CI_CC_OPT }-I/usr/local/include"
+	CI_LD_OPT="${CI_LD_OPT:+$CI_LD_OPT }-L/usr/local/lib"
+fi
+
 # the sanitizer workflow builds through this script as well, so that
 # there is one build path and not two that drift apart
 set --
