@@ -82,10 +82,10 @@ Inside the block:
 
 | parameter | meaning |
 |---|---|
-| `url` | `ldap://` or `ldaps://` followed by host, port, base DN, the attribute a login name is matched against, the scope and a filter.  The attribute is required. |
+| `url` | `ldap://` or `ldaps://` followed by host, port, base DN, the attribute a login name is matched against, the scope and a filter.  The host and the attribute are both required; a url without a host is refused when the configuration is read. |
 | `binddn`, `binddn_passwd` | the account the search is made with.  Without them the search is anonymous. |
 | `group_attribute` | the attribute a group lists its members in, `member` or `uniqueMember` as a rule.  There is no default: a `require group` rule without it refuses every request. |
-| `group_attribute_is_dn` | `on` when that attribute holds distinguished names.  Only `on` is read; left out, the attribute is taken to hold login names. |
+| `group_attribute_is_dn` | `on` when that attribute holds distinguished names, `off`, the default, when it holds login names |
 | `require valid_user` | any account that binds is let in |
 | `require valid_user "<dn>"` | the login name goes into that template, and the result is the DN that is bound, instead of the DN the search found |
 | `require user "<dn>"` | that one account |
@@ -96,8 +96,11 @@ Inside the block:
 | `reconnect_timeout` | how long a connection that was lost waits before it is made again, 10s |
 | `max_down_retries` | how often a connection that the directory dropped is rebuilt right away instead of waiting out `reconnect_timeout`, 0 by default |
 | `referral` | `on` by default; `off` makes a referral an error instead of a redirection |
-| `ssl_check_cert`, `ssl_ca_file`, `ssl_ca_dir` | for `ldaps://`: whether the certificate of the directory is verified, `off` by default and only `on` is read, and which authorities are trusted.  Each block gets a store of its own, holding the authorities it names and nothing else, or the trust store of the system where it names none; one that cannot be loaded fails the configuration.  A certificate is accepted when its chain verifies and it names the host the url names, or the address the connection was made to; the name may come from the common name where there is no subject alternative name, as in nginx's own check, a partial wildcard is refused, and revocation is not checked. |
+| `ssl_check_cert`, `ssl_ca_file`, `ssl_ca_dir` | for `ldaps://`: whether the certificate of the directory is verified, `off` by default, and which authorities are trusted.  Each block with `ssl_check_cert on` gets a store of its own, holding the authorities it names and nothing else, or the trust store of the system where it names none; one that cannot be loaded fails the configuration.  With `off` the two `ssl_ca_*` values are not read at all.  A certificate is accepted when its chain verifies and it names the host the url names, or the address the connection was made to; the name may come from the common name where there is no subject alternative name, as in nginx's own check, a partial wildcard is refused, and revocation is not checked. |
 | `include` | reads a file into the block, for the password that does not belong in the main configuration |
+
+Every one of them takes a value, and a line the block does not know is
+refused rather than dropped.
 
 ### `auth_ldap`
 

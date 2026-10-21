@@ -75,9 +75,11 @@ First release of this fork, from upstream `241200e`.
   address fallback read it), the certificate was never freed, the error
   return of `X509_check_host()` counted as a match, the address fallback
   compared the wrong bytes of the wrong structure, and the trust store was
-  loaded again on every reconnect.  A url that names no host went into
-  `X509_check_host()` as a null pointer, and a partial wildcard in a
-  certificate was a match.
+  loaded again on every reconnect (issue 236, mmguero; pull requests 237,
+  mmguero, and 251, Ericbla).  A partial wildcard in a certificate was a
+  match, and a url that names no host went into `X509_check_host()` as a
+  null pointer -- that check stays, although such a url is now refused
+  before it can be reached.
 - The flag that says the trust store has been filled was set even when
   filling it had failed, and it sat in front of the field the cache key
   stops at, so the first handshake of a worker changed the key of a server
@@ -118,7 +120,16 @@ First release of this fork, from upstream `241200e`.
   behind it.
 - A url that names no host, which RFC 4516 allows, was read as a string
   while the configuration was parsed: the master process went down on
-  `nginx -t`.
+  `nginx -t`.  Such a url is refused now.
+- A line an `ldap_server` block does not know was taken and dropped without
+  a word, so a `require` rule with a typo in it left a server with no rule
+  at all -- which lets in everyone who can bind.  It is refused, as is a
+  line with no value, and `ssl_check_cert` and `group_attribute_is_dn` now
+  read `off` as well as `on` instead of quietly ignoring everything that is
+  not `on`.
+- `ssl_check_cert on` on an nginx built against OpenSSL older than 1.0.2
+  logged that it could not verify anything and then came up anyway, with
+  verification off.  It fails the configuration.
 - `ngx_palloc()` for the url and `ngx_pcalloc()` for a group rule went
   unchecked into `ngx_sprintf()` and `ngx_memcpy()`.
 
@@ -165,6 +176,13 @@ First release of this fork, from upstream `241200e`.
   connection that comes back resets it, so a directory that goes down and
   comes back repeatedly is retried again every time (issue 226).  What this
   release moved is only where the number is kept.
+- The bind DN that `require valid_user "<dn>"` builds is held against its
+  template by the commas it carries, not by parsing it: a login name with a
+  `+` in it builds a relative name with two values without changing that
+  count.  The group rule is read with `ldap_str2dn()`; this one is not, yet.
+- A value in a group rule written in the hexadecimal form a DN allows is
+  not looked at for a null byte, which is only looked for in the written
+  form.
 - The name of a certificate may be taken from its common name where the
   certificate carries no subject alternative name.  RFC 9525 says it should
   not be, and issue 254 asks for that; nginx's own check does the same, and
