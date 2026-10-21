@@ -1,5 +1,48 @@
 # Changelog
 
+## v0.2.1 (2026-10-21)
+
+What the first release of this fork wrote down as not fixed, fixed.
+
+### Fixed
+
+- The bind DN that `require valid_user "<dn>"` builds is read as the
+  distinguished name it is and bound as libldap writes it out again.
+  Counting its commas was not enough: a login name with a plus in it builds
+  one relative name with two values and leaves the count where it was.
+- A value in a relative name that is written in the hexadecimal form a DN
+  allows is refused, in a group rule as in a bind DN.  The written form does
+  not show the bytes it carries, a null byte among them, and libldap hands
+  the decoded bytes on.
+- A host in a `url` is asked again before every connection where
+  `auth_ldap_resolver` says where to ask, so a directory that moved is
+  reached without a reload.  The addresses the configuration resolved used
+  to be all there was.
+
+### Changed
+
+- `max_down_retries` is counted for the connection and no longer for the
+  server.  With more than one connection they counted into the same number
+  and one that came back reset it for all the others.
+- The name in a certificate has to stand in a subject alternative name.  It
+  could come from the common name, which RFC 9525 says it should not, and
+  nginx's own check still allows -- here it does not.  Where that is the
+  certificate one has, `ssl_check_cert chain` is the setting for it.
+
+### Added
+
+- `ssl_check_cert chain`, a third setting between `off` and `on`: the chain
+  is verified and the name is left alone, for a directory whose certificate
+  names something other than the way it is reached.
+- `ssl_crl_file`, a revocation list the certificate of the directory is held
+  against.
+- `auth_ldap_resolver` and `auth_ldap_resolver_timeout`, which say where a
+  host in a `url` is asked of.  A host that cannot be resolved while the
+  configuration is read is an error without them and none with them.
+- `ci/resolve.sh` and `ci/dns.pl`: a nameserver that answers from a file, so
+  that the answer can be changed under a running nginx and the module can be
+  asked whether it asked again.
+
 ## v0.2.0 (2026-10-21)
 
 First release of this fork, from upstream `241200e`.  The number follows
@@ -160,31 +203,3 @@ upstream's own, whose single tag is `v0.1`.
   the configuration parser, and the valgrind job fails when valgrind has
   left no summary behind, since a clean run under `-q` says nothing at all
   and looks exactly like a run that never happened.
-
-### Not fixed
-
-- The addresses of a directory are resolved when the configuration is read,
-  so a changed DNS answer is picked up on the next reload and not before
-  (issue 63; pull request 251 carries a resolver for it, which is not taken
-  over here).
-- Revocation of the certificate of a directory is not checked, and there is
-  no way to ask for it.
-- `ssl_check_cert` is a flag: there is no way to verify the chain and leave
-  the name alone, which pull requests 237 and 251 both propose as a third
-  setting.
-- `max_down_retries` is counted for the server and not for the connection,
-  so with more than one connection they count into the same number; and a
-  connection that comes back resets it, so a directory that goes down and
-  comes back repeatedly is retried again every time (issue 226).  What this
-  release moved is only where the number is kept.
-- The bind DN that `require valid_user "<dn>"` builds is held against its
-  template by the commas it carries, not by parsing it: a login name with a
-  `+` in it builds a relative name with two values without changing that
-  count.  The group rule is read with `ldap_str2dn()`; this one is not, yet.
-- A value in a group rule written in the hexadecimal form a DN allows is
-  not looked at for a null byte, which is only looked for in the written
-  form.
-- The name of a certificate may be taken from its common name where the
-  certificate carries no subject alternative name.  RFC 9525 says it should
-  not be, and issue 254 asks for that; nginx's own check does the same, and
-  this module follows nginx rather than differing from it.

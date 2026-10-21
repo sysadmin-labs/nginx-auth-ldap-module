@@ -3,6 +3,7 @@
 [![Build & Test][build-test-badge]][build-test-link]
 [![Auth][auth-badge]][auth-link]
 [![LDAPS][ldaps-badge]][ldaps-link]
+[![Resolve][resolve-badge]][resolve-link]
 [![Sync connect][sync-connect-badge]][sync-connect-link]
 [![FreeBSD][freebsd-badge]][freebsd-link]
 [![A/UBSan][sanitizers-badge]][sanitizers-link]
@@ -17,6 +18,8 @@
 [auth-link]: https://github.com/sysadmin-labs/nginx-auth-ldap-module/actions/workflows/auth.yml
 [ldaps-badge]: https://github.com/sysadmin-labs/nginx-auth-ldap-module/actions/workflows/ldaps.yml/badge.svg
 [ldaps-link]: https://github.com/sysadmin-labs/nginx-auth-ldap-module/actions/workflows/ldaps.yml
+[resolve-badge]: https://github.com/sysadmin-labs/nginx-auth-ldap-module/actions/workflows/resolve.yml/badge.svg
+[resolve-link]: https://github.com/sysadmin-labs/nginx-auth-ldap-module/actions/workflows/resolve.yml
 [sync-connect-badge]: https://github.com/sysadmin-labs/nginx-auth-ldap-module/actions/workflows/sync-connect.yml/badge.svg
 [sync-connect-link]: https://github.com/sysadmin-labs/nginx-auth-ldap-module/actions/workflows/sync-connect.yml
 [freebsd-badge]: https://github.com/sysadmin-labs/nginx-auth-ldap-module/actions/workflows/freebsd.yml/badge.svg
@@ -94,9 +97,10 @@ Inside the block:
 | `connections` | how many connections to the directory this block keeps, at least 1, which is also the default |
 | `connect_timeout`, `bind_timeout`, `request_timeout` | 10s, 5s and 10s by default |
 | `reconnect_timeout` | how long a connection that was lost waits before it is made again, 10s |
-| `max_down_retries` | how often a connection that the directory dropped is rebuilt right away instead of waiting out `reconnect_timeout`, 0 by default |
+| `max_down_retries` | how often a connection that the directory dropped is rebuilt right away instead of waiting out `reconnect_timeout`, 0 by default.  Counted for the connection, so one that keeps failing does not spend the allowance of the others. |
 | `referral` | `on` by default; `off` makes a referral an error instead of a redirection |
-| `ssl_check_cert`, `ssl_ca_file`, `ssl_ca_dir` | for `ldaps://`: whether the certificate of the directory is verified, `off` by default, and which authorities are trusted.  Each block with `ssl_check_cert on` gets a store of its own, holding the authorities it names and nothing else, or the trust store of the system where it names none; one that cannot be loaded fails the configuration.  With `off` the two `ssl_ca_*` values are not read at all.  A certificate is accepted when its chain verifies and it names the host the url names, or the address the connection was made to; the name may come from the common name where there is no subject alternative name, as in nginx's own check, a partial wildcard is refused, and revocation is not checked. |
+| `ssl_check_cert`, `ssl_ca_file`, `ssl_ca_dir` | for `ldaps://`: `off` by default, `on` for the chain and the name, `chain` for the chain alone.  A block that verifies gets a store of its own, holding the authorities it names and nothing else, or the trust store of the system where it names none; one that cannot be loaded fails the configuration.  With `off` the `ssl_ca_*` values are not read at all.  With `on` a certificate is accepted when its chain verifies and it names the host the url names, or the address the connection was made to; the name has to stand in a subject alternative name, because RFC 9525 says that is where a name belongs, and a partial wildcard is refused.  `chain` is for a directory whose certificate names something else, or names it only in its common name. |
+| `ssl_crl_file` | a revocation list from the same authority.  Where it is set, the certificate of the directory is held against it; the authorities above it are not, because a list for every link is what OpenSSL would then want and an authority that publishes none would verify nothing at all. |
 | `include` | reads a file into the block, for the password that does not belong in the main configuration |
 
 Every one of them takes a value, and a line the block does not know is
@@ -153,6 +157,28 @@ of them.  With the cache switched on, fewer than 100 is refused when the
 configuration is read, as is an expiration below one second; with it
 switched off neither is looked at.
 
+### `auth_ldap_resolver`
+
+**syntax:** `auth_ldap_resolver <address> ...`
+**context:** `http`
+
+Which nameservers a host in a `url` is asked of, in nginx's own syntax, so
+`ipv6=off` and `valid=` work as they do elsewhere.  Without this the
+addresses the configuration resolved are all there is, and a directory that
+moves is reached again on the next reload and not before.  With it the name
+is asked before every connection a worker makes, so an answer that changed
+is taken up as soon as a connection is rebuilt -- which `reconnect_timeout`
+bounds.
+
+A host that cannot be resolved while the configuration is read is an error
+without this directive and none with it.
+
+### `auth_ldap_resolver_timeout`
+
+**syntax:** `auth_ldap_resolver_timeout <time>`
+**default:** `30s`
+**context:** `http`
+
 ### `auth_ldap_servers_size`
 
 **syntax:** `auth_ldap_servers_size <number>`
@@ -186,6 +212,11 @@ A request the module cannot decide is answered 500: no directory answered,
 or none could be reached.  A directory whose certificate is refused has no
 usable connection at all, so a request through it waits out its
 `request_timeout` before it gets that answer.
+
+A host in a `url` is resolved while the configuration is read.  With
+`auth_ldap_resolver` it is asked again before every connection, so a
+directory that moved is reached without a reload; without it the addresses
+from that first resolution are the ones used.
 
 The handler runs in the access phase, so a refused request never reaches the
 content phase.  Every worker keeps its own connections, made when it starts
@@ -224,16 +255,20 @@ ci/build.sh 1.30.5 /tmp/nginx-test
 TEST_NGINX_BINARY=/tmp/nginx-test/sbin/nginx prove -r t/
 ci/auth.sh /tmp/nginx-test/sbin/nginx
 ci/ldaps.sh /tmp/nginx-test/sbin/nginx
+ci/resolve.sh /tmp/nginx-test/sbin/nginx
 ci/sync-connect.sh /tmp/nginx-test/sbin/nginx
 ci/reload.sh /tmp/nginx-test/sbin/nginx
 ```
 
 `t/` covers the configuration parser.  The drivers need a directory and
-start one themselves: `ci/ldap.sh` runs a slapd with four users and two groups,
-`ci/auth.sh` asks who gets in, `ci/ldaps.sh` does the same over TLS and
-checks what a refused certificate does, `ci/sync-connect.sh` repeats the
-matrix with a `connect(2)` that comes back already connected, and
-`ci/reload.sh` authenticates again after every one of eight reloads.
+start one themselves: `ci/ldap.sh` runs a slapd with four users and two groups, and with a
+certificate authority, a server certificate and two revocation lists when it
+is asked for TLS.  `ci/auth.sh` asks who gets in, `ci/ldaps.sh` does the
+same over TLS and holds four certificates and two revocation lists against
+each other, `ci/resolve.sh` changes what a name answers under a running
+nginx, `ci/sync-connect.sh` repeats the matrix with a `connect(2)` that
+comes back already connected, and `ci/reload.sh` authenticates again after
+every one of eight reloads.
 
 ## Credits and license
 

@@ -50,6 +50,7 @@ jobs:
             # same case is harmless, which is why the Linux job cannot show
             # it.
             ci/sync-connect.sh "$HOME/nginx/sbin/nginx"
+            ci/resolve.sh "$HOME/nginx/sbin/nginx"
             # www/nginx ships this module as a loadable object, so that is
             # the build the package is made of and it is built here too
             ci/build.sh "$NGINX_VERSION" "$HOME/nginx-dyn" dynamic

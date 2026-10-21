@@ -93,7 +93,48 @@ subjectAltName = DNS:localhost
 EXT
 		{ echo "the server certificate could not be made" >&2; exit 2; }
 
-	chmod 644 "$WORK/tls"/*.crt "$WORK/tls"/*.key
+	# Two revocation lists from the same authority: one that revokes
+	# nothing and one that revokes the certificate above.  A driver holds
+	# them against each other, which is the only way to tell a server that
+	# checks revocation from one that merely says so.
+	mkdir -p "$WORK/tls/ca.d/newcerts"
+	: > "$WORK/tls/ca.d/index.txt"
+	echo 1000 > "$WORK/tls/ca.d/serial"
+	echo 1000 > "$WORK/tls/ca.d/crlnumber"
+	cat > "$WORK/tls/ca.d/openssl.cnf" <<CACNF
+[ ca ]
+default_ca = test_ca
+
+[ test_ca ]
+dir               = $WORK/tls/ca.d
+database          = \$dir/index.txt
+new_certs_dir     = \$dir/newcerts
+serial            = \$dir/serial
+crlnumber         = \$dir/crlnumber
+certificate       = $WORK/tls/ca.crt
+private_key       = $WORK/tls/ca.key
+default_md        = sha256
+default_crl_days  = 30
+policy            = test_policy
+email_in_dn       = no
+rand_serial       = no
+unique_subject    = no
+
+[ test_policy ]
+commonName = supplied
+CACNF
+
+	openssl ca -config "$WORK/tls/ca.d/openssl.cnf" -gencrl \
+		-out "$WORK/tls/crl-none.pem" > /dev/null 2>&1 ||
+		{ echo "the empty revocation list could not be made" >&2; exit 2; }
+
+	openssl ca -config "$WORK/tls/ca.d/openssl.cnf" \
+		-revoke "$WORK/tls/server.crt" > /dev/null 2>&1 &&
+	openssl ca -config "$WORK/tls/ca.d/openssl.cnf" -gencrl \
+		-out "$WORK/tls/crl-server.pem" > /dev/null 2>&1 ||
+		{ echo "the revocation list could not be made" >&2; exit 2; }
+
+	chmod 644 "$WORK/tls"/*.crt "$WORK/tls"/*.key "$WORK/tls"/*.pem
 fi
 
 {

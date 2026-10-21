@@ -50,6 +50,11 @@ extern int ldap_init_fd(ber_socket_t fd, int proto, const char *url, LDAP **ld);
 
 #define NGX_HTTP_AUTH_LDAP_MAX_SERVERS_SIZE 7
 
+/* what ssl_check_cert asks for */
+#define NGX_HTTP_AUTH_LDAP_CERT_OFF    0
+#define NGX_HTTP_AUTH_LDAP_CERT_CHAIN  1
+#define NGX_HTTP_AUTH_LDAP_CERT_FULL   2
+
 
 /*
  * One require group rule, and how many commas its template carries.  The
@@ -76,9 +81,10 @@ typedef struct {
     ngx_str_t group_attribute;
     ngx_flag_t group_attribute_dn;
 
-    ngx_flag_t ssl_check_cert;
+    ngx_uint_t ssl_check_cert;
     ngx_str_t ssl_ca_dir;
     ngx_str_t ssl_ca_file;
+    ngx_str_t ssl_crl_file;
 
     ngx_array_t *require_group;     /* of ngx_http_auth_ldap_group_rule_t */
     ngx_array_t *require_user;      /* array of ngx_http_complex_value_t */
@@ -104,15 +110,6 @@ typedef struct {
      * else.  Servers with such a rule are therefore not cached.
      */
     ngx_flag_t cacheable;
-
-    /*
-     * How often a connection of this server that the directory dropped has
-     * been rebuilt right away.  Behind free_connections for the same reason
-     * as conns: it changes while the worker runs, and in front of that field
-     * a directory that drops a connection would change the hash of a server
-     * whose configuration has not changed.
-     */
-    ngx_uint_t max_down_retries_count;
 
 #if (NGX_OPENSSL)
     /*
@@ -143,6 +140,26 @@ typedef struct {
      * the same one.
      */
     ngx_array_t *conns;         /* of ngx_http_auth_ldap_connection_t * */
+
+    /*
+     * Whether the url names a host rather than an address, and what to ask.
+     * A name is asked again for every connection that is made, so an answer
+     * that changed is taken up without a reload; the addresses the
+     * configuration resolved are what is left when nothing is configured to
+     * ask with.
+     */
+    ngx_flag_t resolve;
+    ngx_resolver_t *resolver;
+    ngx_msec_t resolver_timeout;
+
+    /*
+     * Set where the host could not be resolved while the configuration was
+     * read.  That is an error without a resolver and none with one: the name
+     * is asked when a connection is made, which is the whole point of
+     * having one.  init_main_conf decides, because the resolver may be
+     * configured after this block.
+     */
+    ngx_flag_t unresolved;
 } ngx_http_auth_ldap_server_t;
 
 typedef struct {
@@ -151,6 +168,8 @@ typedef struct {
     ngx_msec_t cache_expiration_time;
     size_t cache_size;
     ngx_int_t servers_size;
+    ngx_resolver_t *resolver;
+    ngx_msec_t resolver_timeout;
 #if (NGX_OPENSSL)
     ngx_ssl_t ssl;
 #endif
@@ -220,6 +239,7 @@ typedef struct {
 
 typedef enum {
     STATE_DISCONNECTED,
+    STATE_RESOLVING,
     STATE_INITIAL_BINDING,
     STATE_CONNECTING,
     STATE_READY,
@@ -247,6 +267,20 @@ typedef struct ngx_http_auth_ldap_connection {
     int msgid;
 
     /*
+     * How often this connection has been rebuilt at once after the
+     * directory dropped it.  Per connection and not per server: with more
+     * than one connection they counted into the same number, and one that
+     * came back reset it for all the others.
+     */
+    ngx_uint_t down_retries;
+
+    /* the address a name was resolved to, for this attempt only */
+    ngx_addr_t resolved_addr;
+    ngx_sockaddr_t resolved_sockaddr;
+    u_char resolved_name[NGX_SOCKADDR_STRLEN];
+    unsigned resolved:1;
+
+    /*
      * Closing runs through libldap: ldap_unbind_ext() calls the sockbuf's
      * close, which closes the connection again.  One pass is enough.
      */
@@ -258,6 +292,7 @@ static char * ngx_http_auth_ldap_ldap_server(ngx_conf_t *cf, ngx_command_t *dumm
 static char * ngx_http_auth_ldap(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static char * ngx_http_auth_ldap_servers(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static char * ngx_http_auth_ldap_parse_url(ngx_conf_t *cf, ngx_http_auth_ldap_server_t *server);
+static char * ngx_http_auth_ldap_resolver(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static char * ngx_http_auth_ldap_parse_require(ngx_conf_t *cf, ngx_http_auth_ldap_server_t *server);
 static ngx_uint_t ngx_http_auth_ldap_count_commas(ngx_str_t *s);
 static ngx_flag_t ngx_http_auth_ldap_ends_in_variable(ngx_str_t *s);
@@ -275,6 +310,7 @@ static void ngx_http_auth_ldap_exit_worker(ngx_cycle_t *cycle);
 static ngx_int_t ngx_http_auth_ldap_init(ngx_conf_t *cf);
 static ngx_int_t ngx_http_auth_ldap_init_cache(ngx_cycle_t *cycle);
 static void ngx_http_auth_ldap_close_connection(ngx_http_auth_ldap_connection_t *c);
+static void ngx_http_auth_ldap_connect(ngx_http_auth_ldap_connection_t *c);
 static void ngx_http_auth_ldap_read_handler(ngx_event_t *rev);
 static void ngx_http_auth_ldap_reconnect_handler(ngx_event_t *);
 static ngx_int_t ngx_http_auth_ldap_init_connections(ngx_cycle_t *cycle);
@@ -325,6 +361,22 @@ static ngx_command_t ngx_http_auth_ldap_commands[] = {
         ngx_conf_set_size_slot,
         NGX_HTTP_MAIN_CONF_OFFSET,
         offsetof(ngx_http_auth_ldap_main_conf_t, cache_size),
+        NULL
+    },
+    {
+        ngx_string("auth_ldap_resolver"),
+        NGX_HTTP_MAIN_CONF | NGX_CONF_1MORE,
+        ngx_http_auth_ldap_resolver,
+        NGX_HTTP_MAIN_CONF_OFFSET,
+        0,
+        NULL
+    },
+    {
+        ngx_string("auth_ldap_resolver_timeout"),
+        NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1,
+        ngx_conf_set_msec_slot,
+        NGX_HTTP_MAIN_CONF_OFFSET,
+        offsetof(ngx_http_auth_ldap_main_conf_t, resolver_timeout),
         NULL
     },
     {
@@ -516,9 +568,12 @@ ngx_http_auth_ldap_ldap_server(ngx_conf_t *cf, ngx_command_t *dummy, void *conf)
         }
         server->connections = i;
     } else if (ngx_strcmp(value[0].data, "ssl_check_cert") == 0) {
-      if (ngx_strcmp(value[1].data, "on") == 0) {
+      if (ngx_strcmp(value[1].data, "on") == 0
+          || ngx_strcmp(value[1].data, "chain") == 0)
+      {
       #if OPENSSL_VERSION_NUMBER >= 0x10002000
-        server->ssl_check_cert = 1;
+        server->ssl_check_cert = ngx_strcmp(value[1].data, "chain") == 0
+            ? NGX_HTTP_AUTH_LDAP_CERT_CHAIN : NGX_HTTP_AUTH_LDAP_CERT_FULL;
       #else
       #if GNUC > 4
       #warning "http_auth_ldap: Compiling with OpenSSL < 1.0.2, certificate verification will be unavailable. OPENSSL_VERSION_NUMBER == " XSTR(OPENSSL_VERSION_NUMBER)
@@ -531,17 +586,19 @@ ngx_http_auth_ldap_ldap_server(ngx_conf_t *cf, ngx_command_t *dummy, void *conf)
         return NGX_CONF_ERROR;
       #endif
       } else if (ngx_strcmp(value[1].data, "off") == 0) {
-        server->ssl_check_cert = 0;
+        server->ssl_check_cert = NGX_HTTP_AUTH_LDAP_CERT_OFF;
       } else {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-          "http_auth_ldap: \"ssl_check_cert\" takes \"on\" or \"off\", not "
-          "\"%V\".", &value[1]);
+          "http_auth_ldap: \"ssl_check_cert\" takes \"on\", \"chain\" or "
+          "\"off\", not \"%V\".", &value[1]);
         return NGX_CONF_ERROR;
       }
     } else if (ngx_strcmp(value[0].data, "ssl_ca_dir") == 0) {
       server->ssl_ca_dir = value[1];
     } else if (ngx_strcmp(value[0].data, "ssl_ca_file") == 0) {
       server->ssl_ca_file = value[1];
+    } else if (ngx_strcmp(value[0].data, "ssl_crl_file") == 0) {
+      server->ssl_crl_file = value[1];
     }
     else CONF_MSEC_VALUE(cf,value,server,connect_timeout)
     else CONF_MSEC_VALUE(cf,value,server,reconnect_timeout)
@@ -672,6 +729,9 @@ ngx_http_auth_ldap_free_urldesc(void *data)
 static char *
 ngx_http_auth_ldap_parse_url(ngx_conf_t *cf, ngx_http_auth_ldap_server_t *server)
 {
+#if (NGX_HAVE_INET6)
+    u_char v6[16];
+#endif
     ngx_str_t *value;
     u_char *p;
     ngx_pool_cleanup_t *cln;
@@ -764,12 +824,35 @@ ngx_http_auth_ldap_parse_url(ngx_conf_t *cf, ngx_http_auth_ldap_server_t *server
     server->parsed_url.url.data = (u_char *) server->ludpp->lud_host;
     server->parsed_url.url.len = ngx_strlen(server->ludpp->lud_host);
     server->parsed_url.default_port = server->ludpp->lud_port;
+
+    /*
+     * A host that is not written as an address is a name, and a name can be
+     * asked again later.  ngx_parse_url() resolves it here either way, so a
+     * configuration without a resolver keeps working exactly as it did.
+     */
+    if (ngx_inet_addr(server->parsed_url.url.data, server->parsed_url.url.len)
+            == INADDR_NONE
+#if (NGX_HAVE_INET6)
+        && ngx_inet6_addr(server->parsed_url.url.data,
+               server->parsed_url.url.len, v6) != NGX_OK
+#endif
+       )
+    {
+        server->resolve = 1;
+    }
+
     if (ngx_parse_url(cf->pool, &server->parsed_url) != NGX_OK) {
-        if (server->parsed_url.err) {
-            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "http_auth_ldap: %s in LDAP hostname \"%V\"",
-                server->parsed_url.err, &server->parsed_url.url);
+        if (!server->resolve) {
+            /* not a name, so there is nothing a nameserver could add */
+            if (server->parsed_url.err) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "http_auth_ldap: %s in LDAP hostname \"%V\"",
+                    server->parsed_url.err, &server->parsed_url.url);
+            }
+            return NGX_CONF_ERROR;
         }
-        return NGX_CONF_ERROR;
+
+        server->unresolved = 1;
+        server->parsed_url.naddrs = 0;
     }
 
     if (ngx_strcmp(server->ludpp->lud_scheme, "ldap") == 0) {
@@ -790,6 +873,29 @@ ngx_http_auth_ldap_parse_url(ngx_conf_t *cf, ngx_http_auth_ldap_server_t *server
             server->ludpp->lud_scheme);
         return NGX_CONF_ERROR;
     }
+}
+
+/*
+ * Which nameservers a host in a url is asked of.  Without this the
+ * addresses the configuration resolved are all there is, and a changed
+ * answer is taken up on the next reload and not before.
+ */
+static char *
+ngx_http_auth_ldap_resolver(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_auth_ldap_main_conf_t *halmcf = conf;
+    ngx_str_t                      *value = cf->args->elts;
+
+    if (halmcf->resolver != NULL) {
+        return "is duplicate";
+    }
+
+    halmcf->resolver = ngx_resolver_create(cf, &value[1], cf->args->nelts - 1);
+    if (halmcf->resolver == NULL) {
+        return NGX_CONF_ERROR;
+    }
+
+    return NGX_CONF_OK;
 }
 
 /**
@@ -988,6 +1094,7 @@ ngx_http_auth_ldap_create_main_conf(ngx_conf_t *cf)
     conf->cache_expiration_time = NGX_CONF_UNSET_MSEC;
     conf->cache_size = NGX_CONF_UNSET_SIZE;
     conf->servers_size = NGX_CONF_UNSET;
+    conf->resolver_timeout = NGX_CONF_UNSET_MSEC;
 
     return conf;
 }
@@ -1059,10 +1166,65 @@ ngx_http_auth_ldap_init_main_conf(ngx_conf_t *cf, void *parent)
                 return NGX_CONF_ERROR;
             }
 
+            /*
+             * A revocation list, where one is named, goes into the same
+             * store, and the store is told to look at it.  Only the
+             * certificate of the directory is held against it and not the
+             * authorities above it: a list for every link of the chain is
+             * what X509_V_FLAG_CRL_CHECK_ALL asks for, and an authority
+             * that publishes none would then verify nothing at all.
+             */
+            if (server->ssl_crl_file.data) {
+                X509_LOOKUP *lookup;
+
+                lookup = X509_STORE_add_lookup(store, X509_LOOKUP_file());
+
+                if (lookup == NULL
+                    || X509_load_crl_file(lookup,
+                           (char *) server->ssl_crl_file.data,
+                           X509_FILETYPE_PEM) != 1)
+                {
+                    unsigned long error_code = ERR_get_error();
+
+                    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                        "http_auth_ldap: the revocation list of \"%V\" could "
+                        "not be loaded: %s", &server->alias,
+                        ERR_error_string(error_code, NULL));
+                    return NGX_CONF_ERROR;
+                }
+
+                X509_STORE_set_flags(store, X509_V_FLAG_CRL_CHECK);
+            }
+
             server->ssl_store = store;
         }
     }
 #endif
+
+    if (conf->resolver_timeout == NGX_CONF_UNSET_MSEC) {
+        conf->resolver_timeout = 30000;
+    }
+
+    if (conf->servers != NULL) {
+        ngx_uint_t i;
+
+        for (i = 0; i < conf->servers->nelts; i++) {
+            ngx_http_auth_ldap_server_t *server =
+                &((ngx_http_auth_ldap_server_t *) conf->servers->elts)[i];
+
+            server->resolver = conf->resolver;
+            server->resolver_timeout = conf->resolver_timeout;
+
+            if (server->unresolved && server->resolver == NULL) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                    "http_auth_ldap: the host \"%V\" of \"%V\" could not be "
+                    "resolved, and no auth_ldap_resolver is configured to "
+                    "ask it of later", &server->parsed_url.url,
+                    &server->alias);
+                return NGX_CONF_ERROR;
+            }
+        }
+    }
 
     if (conf->cache_enabled == NGX_CONF_UNSET) {
         conf->cache_enabled = 0;
@@ -1751,15 +1913,29 @@ ngx_http_auth_ldap_ssl_handshake_handler(ngx_connection_t *conn, ngx_flag_t vali
           }
 
           /*
+           * "chain" asks for the chain and nothing else: a directory whose
+           * certificate names something other than the way it is reached is
+           * then still its directory, and the configuration said so.
+           */
+          if (c->server->ssl_check_cert == NGX_HTTP_AUTH_LDAP_CERT_CHAIN) {
+            X509_free(cert);
+            conn->read->handler = &ngx_http_auth_ldap_read_handler;
+            ngx_http_auth_ldap_restore_handlers(conn);
+            ngx_http_auth_ldap_connection_established(c);
+            return;
+          }
+
+          /*
            * 1 is a match, 0 is none, and anything below that is a failure of
            * the check itself: all of them are "not verified".  A partial
-           * wildcard is refused; a directory the configuration names by its
-           * host does not need one, and nginx's own check is the model for
-           * the rest, including the fall back to the common name where the
-           * certificate carries no subject alternative name.
+           * wildcard is refused, and so is the common name: RFC 9525 says a
+           * name belongs in a subject alternative name, and a certificate
+           * that carries none names nothing this can be held against.  Where
+           * that is the certificate one has, "chain" is the setting for it.
            */
           addr_verified = X509_check_host(cert, hostname, 0,
-              X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS, NULL);
+              X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS
+              | X509_CHECK_FLAG_NEVER_CHECK_SUBJECT, NULL);
 
           if (addr_verified != 1) {
             size_t len = 0;
@@ -1957,15 +2133,15 @@ ngx_http_auth_ldap_read_handler(ngx_event_t *rev)
 
             // if LDAP_SERVER_DOWN (usually timeouts or server disconnects)
             if (rc == LDAP_SERVER_DOWN && \
-                c->server->max_down_retries_count < c->server->max_down_retries) { 
+                c->down_retries < c->server->max_down_retries) { 
                 /** 
                     update counter (this is always reset in 
                     ngx_http_auth_ldap_connect() for a successful ldap 
                     connection  
                 **/
-                c->server->max_down_retries_count++;
+                c->down_retries++;
                 ngx_log_error(NGX_LOG_ERR, c->log, 0, "http_auth_ldap: LDAP_SERVER_DOWN: retry count: %d",
-                    c->server->max_down_retries_count);
+                    c->down_retries);
                 /*
                  * rev belongs to the nginx connection that closing has just
                  * given back, so the handler cannot be called with it: it
@@ -2077,6 +2253,52 @@ ngx_http_auth_ldap_read_handler(ngx_event_t *rev)
     }
 }
 
+/*
+ * What a name answered, for this attempt.  The handler is where the connect
+ * carries on, so that the worker is not held while the answer is waited
+ * for.  A failure waits out reconnect_timeout like any other.
+ */
+static void
+ngx_http_auth_ldap_resolve_handler(ngx_resolver_ctx_t *rctx)
+{
+    ngx_http_auth_ldap_connection_t *c = rctx->data;
+    ngx_uint_t                       i;
+    socklen_t                        socklen;
+
+    if (rctx->state) {
+        ngx_log_error(NGX_LOG_ERR, c->log, 0,
+            "http_auth_ldap: \"%V\" could not be resolved: %s", &rctx->name,
+            ngx_resolver_strerror(rctx->state));
+        ngx_resolve_name_done(rctx);
+        c->state = STATE_DISCONNECTED;
+        ngx_add_timer(&c->reconnect_event, c->server->reconnect_timeout);
+        return;
+    }
+
+    i = ngx_random() % rctx->naddrs;
+    socklen = rctx->addrs[i].socklen;
+
+    if (socklen > (socklen_t) sizeof(ngx_sockaddr_t)) {
+        socklen = (socklen_t) sizeof(ngx_sockaddr_t);
+    }
+
+    ngx_memcpy(&c->resolved_sockaddr, rctx->addrs[i].sockaddr, socklen);
+    ngx_resolve_name_done(rctx);
+
+    /* the answer carries no port, and the url is where the port is */
+    ngx_inet_set_port(&c->resolved_sockaddr.sockaddr,
+        (in_port_t) c->server->ludpp->lud_port);
+
+    c->resolved_addr.sockaddr = &c->resolved_sockaddr.sockaddr;
+    c->resolved_addr.socklen = socklen;
+    c->resolved_addr.name.data = c->resolved_name;
+    c->resolved_addr.name.len = ngx_sock_ntop(&c->resolved_sockaddr.sockaddr,
+        socklen, c->resolved_name, NGX_SOCKADDR_STRLEN, 1);
+    c->resolved = 1;
+
+    ngx_http_auth_ldap_connect(c);
+}
+
 static void
 ngx_http_auth_ldap_connect(ngx_http_auth_ldap_connection_t *c)
 {
@@ -2085,7 +2307,58 @@ ngx_http_auth_ldap_connect(ngx_http_auth_ldap_connection_t *c)
     ngx_addr_t *addr;
     ngx_int_t rc;
 
-    addr = &c->server->parsed_url.addrs[ngx_random() % c->server->parsed_url.naddrs];
+    /*
+     * A name is asked before every connection, so an answer that changed is
+     * taken up without a reload.  Without a resolver there is nothing to ask
+     * and the addresses the configuration resolved are used, as before.
+     */
+    if (c->server->resolve && c->server->resolver != NULL && !c->resolved) {
+        ngx_resolver_ctx_t *rctx, temp;
+
+        temp.name = c->server->parsed_url.url;
+
+        rctx = ngx_resolve_start(c->server->resolver, &temp);
+        if (rctx == NULL || rctx == NGX_NO_RESOLVER) {
+            ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                "http_auth_ldap: \"%V\" cannot be asked of a nameserver",
+                &c->server->parsed_url.url);
+            ngx_add_timer(&c->reconnect_event, c->server->reconnect_timeout);
+            return;
+        }
+
+        rctx->name = c->server->parsed_url.url;
+        rctx->handler = ngx_http_auth_ldap_resolve_handler;
+        rctx->data = c;
+        rctx->timeout = c->server->resolver_timeout;
+
+        c->state = STATE_RESOLVING;
+
+        if (ngx_resolve_name(rctx) != NGX_OK) {
+            ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                "http_auth_ldap: \"%V\" could not be asked of a nameserver",
+                &c->server->parsed_url.url);
+            c->state = STATE_DISCONNECTED;
+            ngx_add_timer(&c->reconnect_event, c->server->reconnect_timeout);
+        }
+
+        return;
+    }
+
+    if (c->resolved) {
+        addr = &c->resolved_addr;
+        c->resolved = 0;
+    } else {
+        if (c->server->parsed_url.naddrs == 0) {
+            /* a name that was never resolved and nothing to ask with */
+            ngx_log_error(NGX_LOG_ERR, c->log, 0,
+                "http_auth_ldap: no address is known for \"%V\"",
+                &c->server->parsed_url.url);
+            ngx_add_timer(&c->reconnect_event, c->server->reconnect_timeout);
+            return;
+        }
+
+        addr = &c->server->parsed_url.addrs[ngx_random() % c->server->parsed_url.naddrs];
+    }
 
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0, "http_auth_ldap: Connecting to LDAP server \"%V\".",
         &addr->name);
@@ -2117,7 +2390,7 @@ ngx_http_auth_ldap_connect(ngx_http_auth_ldap_connection_t *c)
     ngx_add_timer(conn->read, c->server->connect_timeout);
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0, "http_auth_ldap: connect_timeout=%d.", c->server->connect_timeout);
 
-    c->server->max_down_retries_count = 0;   /* reset retries count */
+    c->down_retries = 0;
     c->state = STATE_CONNECTING;
 
     /*
@@ -2727,6 +3000,48 @@ ngx_http_auth_ldap_ends_in_variable(ngx_str_t *s)
     return 1;
 }
 
+/*
+ * Whether a relative name is one value, written as text, that holds no null
+ * byte.  Two values joined with a plus is a name the filter and the bind
+ * cannot both mean; a value in the hexadecimal form a DN allows carries
+ * bytes the written form does not show, a null among them, and libldap
+ * hands the decoded bytes on.
+ */
+static ngx_int_t
+ngx_http_auth_ldap_check_rdn(ngx_http_request_t *r, LDAPRDN rdn)
+{
+    ngx_str_t  val;
+    LDAPAVA   *ava;
+
+    if (rdn[1] != NULL) {
+        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+            "http_auth_ldap: a relative name holds more than one value, so "
+            "it is refused");
+        return NGX_DECLINED;
+    }
+
+    ava = rdn[0];
+
+    if (ava->la_flags & LDAP_AVA_BINARY) {
+        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+            "http_auth_ldap: the value of \"%s\" is written as hexadecimal, "
+            "so it is refused", ava->la_attr.bv_val);
+        return NGX_DECLINED;
+    }
+
+    val.data = (u_char *) ava->la_value.bv_val;
+    val.len = ava->la_value.bv_len;
+
+    if (memchr(val.data, '\0', val.len) != NULL) {
+        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+            "http_auth_ldap: the value of \"%s\" carries a null byte, so it "
+            "is refused", ava->la_attr.bv_val);
+        return NGX_DECLINED;
+    }
+
+    return NGX_OK;
+}
+
 static ngx_int_t
 ngx_http_auth_ldap_has_null(ngx_str_t *s)
 {
@@ -2835,11 +3150,7 @@ ngx_http_auth_ldap_read_group(ngx_http_request_t *r,
         return NGX_DECLINED;
     }
 
-    /* one value, because the filter can only assert on one */
-    if ((*dn)[0][1] != NULL) {
-        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
-            "http_auth_ldap: the first relative name of \"%V\" holds more "
-            "than one value, so it is refused", val);
+    if (ngx_http_auth_ldap_check_rdn(r, (*dn)[0]) != NGX_OK) {
         return NGX_DECLINED;
     }
 
@@ -2865,18 +3176,22 @@ ngx_http_auth_ldap_read_group(ngx_http_request_t *r,
 }
 
 /*
- * The bind DN that require_valid_user_dn builds, and whether it still has
- * the shape its template had.  A variable in it is a value, not a place to
- * put another relative name, so a comma the template does not have means
- * the login name moved the account somewhere else.  The DN that comes back
- * is the one that was held against the template: evaluating the value a
- * second time would bind something that was never checked.
+ * The bind DN that require_valid_user_dn builds: read as the distinguished
+ * name it is, held against the shape its template wrote, and handed back as
+ * libldap writes it out again.  Counting commas alone was not enough -- a
+ * login name with a plus in it builds a relative name with two values and
+ * leaves the count where it was -- and what is bound is now what was read,
+ * not the text it came from.
  */
 static ngx_int_t
 ngx_http_auth_ldap_build_bind_dn(ngx_http_request_t *r,
     ngx_http_auth_ldap_ctx_t *ctx, ngx_str_t *dn)
 {
-    ngx_str_t value;
+    ngx_str_t   value, built;
+    LDAPDN      parsed;
+    char       *written;
+    ngx_uint_t  i;
+    ngx_int_t   rc;
 
     if (ngx_http_complex_value(r, &ctx->server->require_valid_user_dn, &value)
         != NGX_OK)
@@ -2885,42 +3200,83 @@ ngx_http_auth_ldap_build_bind_dn(ngx_http_request_t *r,
     }
 
     /*
-     * ldap_sasl_bind() takes the DN as a C string, and what a complex value
-     * hands back is not one: it is a length and a buffer the pool does not
-     * terminate.  Without a null byte the bind sends whatever the pool put
-     * behind the value -- it reached the directory as the DN that was asked
-     * for with a piece of this worker's memory stuck to the end of it, and
-     * the account it then named exists on no server.  The search path copies
-     * len + 1 for the same reason; this one did not.
+     * libldap takes a DN as a C string, and what a complex value hands back
+     * is not one: it is a length and a buffer the pool does not terminate.
      */
-    dn->len = value.len;
-    dn->data = ngx_pnalloc(r->pool, value.len + 1);
-    if (dn->data == NULL) {
+    built.len = value.len;
+    built.data = ngx_pnalloc(r->pool, value.len + 1);
+    if (built.data == NULL) {
         return NGX_ERROR;
     }
-    ngx_memcpy(dn->data, value.data, value.len);
-    dn->data[value.len] = '\0';
+    ngx_memcpy(built.data, value.data, value.len);
+    built.data[value.len] = '\0';
 
-    if (ngx_http_auth_ldap_has_null(dn)) {
+    if (ngx_http_auth_ldap_has_null(&built)) {
         ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
             "http_auth_ldap: the bind DN carries a null byte, so it is "
             "refused");
         return NGX_DECLINED;
     }
 
-    if (ctx->server->valid_user_dn_commas >= 0) {
-        ngx_uint_t commas = ngx_http_auth_ldap_count_commas(dn);
+    if (ldap_str2dn((const char *) built.data, &parsed, LDAP_DN_FORMAT_LDAPV3)
+            != LDAP_SUCCESS
+        || parsed == NULL)
+    {
+        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+            "http_auth_ldap: the bind DN \"%V\" is not a distinguished name, "
+            "so it is refused", &built);
+        return NGX_DECLINED;
+    }
 
-        if (ctx->server->valid_user_dn_commas_min
-                ? commas < (ngx_uint_t) ctx->server->valid_user_dn_commas
-                : commas != (ngx_uint_t) ctx->server->valid_user_dn_commas)
-        {
-            ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
-                "http_auth_ldap: the bind DN \"%V\" is not shaped like its "
-                "configuration, so it is refused", dn);
-            return NGX_DECLINED;
+    rc = NGX_OK;
+
+    for (i = 0; parsed[i] != NULL; i++) {
+        if (ngx_http_auth_ldap_check_rdn(r, parsed[i]) != NGX_OK) {
+            rc = NGX_DECLINED;
+            break;
         }
     }
+
+    /*
+     * As many relative names as the template wrote, counting the one the
+     * commas separate from the rest.  A variable that ends the template may
+     * bring more of them, because the tail of the name is then its own.
+     */
+    if (rc == NGX_OK && ctx->server->valid_user_dn_commas >= 0) {
+        ngx_uint_t want = (ngx_uint_t) ctx->server->valid_user_dn_commas + 1;
+
+        if (ctx->server->valid_user_dn_commas_min ? i < want : i != want) {
+            ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+                "http_auth_ldap: the bind DN \"%V\" is not shaped like its "
+                "configuration, so it is refused", &built);
+            rc = NGX_DECLINED;
+        }
+    }
+
+    if (rc == NGX_OK
+        && ldap_dn2str(parsed, &written, LDAP_DN_FORMAT_LDAPV3) != LDAP_SUCCESS)
+    {
+        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+            "http_auth_ldap: the bind DN \"%V\" could not be written out",
+            &built);
+        rc = NGX_ERROR;
+    }
+
+    ldap_dnfree(parsed);
+
+    if (rc != NGX_OK) {
+        return rc;
+    }
+
+    /* into the pool, because libldap's copy goes back right away */
+    dn->len = ngx_strlen(written);
+    dn->data = ngx_pnalloc(r->pool, dn->len + 1);
+    if (dn->data == NULL) {
+        ldap_memfree(written);
+        return NGX_ERROR;
+    }
+    ngx_memcpy(dn->data, written, dn->len + 1);
+    ldap_memfree(written);
 
     return NGX_OK;
 }

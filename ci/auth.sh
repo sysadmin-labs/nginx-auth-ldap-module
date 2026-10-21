@@ -381,6 +381,27 @@ echo "  the member of that group: $out"
 [ "$out" = 200 ] ||
 	note "a group whose name carries a comma was split in the middle, got $out"
 
+echo "== a relative name holds one value, written as text"
+# The template is "uid=$remote_user,...", so a login name with a plus in it
+# builds one relative name with two values -- uid=alice and uid=admin -- and
+# leaves the number of commas exactly where it was.  Counting commas cannot
+# see it; reading the name as a name can.
+out=$(code -u 'alice+uid=admin:alicepw' "http://127.0.0.1:$PORT/vardn.txt")
+echo "  a login name that adds a second value: $out"
+[ "$out" = 401 ] ||
+	note "a login name with a plus in it was accepted, got $out"
+grep -q "holds more than one value" "$WORK/logs/error.log" ||
+	note "the error log does not say that the relative name was refused"
+# A value in the hexadecimal form a DN allows carries bytes the written form
+# does not show, and libldap hands the decoded bytes on.
+out=$(code -u alice:alicepw -H 'X-Group: #040461626300' \
+	"http://127.0.0.1:$PORT/vargroup.txt")
+echo "  a group value written as hexadecimal: $out"
+[ "$out" = 401 ] ||
+	note "a hexadecimal group value was accepted, got $out"
+grep -q "written as hexadecimal" "$WORK/logs/error.log" ||
+	note "the error log does not say that the hexadecimal value was refused"
+
 echo "== the base a group is searched under keeps its shape"
 out=$(code -u alice:alicepw -H 'X-Base: ou=groups,dc=test,dc=local' \
 	"http://127.0.0.1:$PORT/varbase.txt")

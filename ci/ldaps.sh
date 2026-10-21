@@ -29,13 +29,16 @@ note() { echo "  $1" >&2; fail=1; }
 
 "$SRC/ci/ldap.sh" tls "$LPORT" > /dev/null
 CA=${CI_WORK:-$SRC/ci-work}/ldap/tls/ca.crt
+CRL_NONE=${CI_WORK:-$SRC/ci-work}/ldap/tls/crl-none.pem
+CRL_SERVER=${CI_WORK:-$SRC/ci-work}/ldap/tls/crl-server.pem
 [ -f "$CA" ] || { echo "the test ca is missing" >&2; exit 1; }
 
 load=
 [ -n "${LDAPS_LOAD_MODULE:-}" ] && load="load_module $LDAPS_LOAD_MODULE;"
 
 server_block() {
-	# $1 name, $2 host, $3 ssl_check_cert, $4 ca file or empty
+	# $1 name, $2 host, $3 ssl_check_cert, $4 ca file or empty,
+	# $5 revocation list or empty
 	cat <<BLOCK
     ldap_server $1 {
         url ldaps://$2:$LPORT/ou=people,dc=test,dc=local?uid?sub?(objectClass=inetOrgPerson);
@@ -45,6 +48,7 @@ server_block() {
         ssl_check_cert $3;
 BLOCK
 	[ -n "$4" ] && echo "        ssl_ca_file $4;"
+	[ -n "${5:-}" ] && echo "        ssl_crl_file $5;"
 	cat <<BLOCK
     }
 BLOCK
@@ -120,6 +124,9 @@ refused() { curl -s -o /dev/null -w '%{http_code}' --max-time "${LDAPS_TMO:-25}"
 	server_block byname   localhost on  "$CA";
 	server_block byaddr   127.0.0.1 on  "$CA";
 	server_block systemca localhost on  "";
+	server_block bychain  127.0.0.1 chain "$CA";
+	server_block crlok    localhost on  "$CA" "$CRL_NONE";
+	server_block crlbad   localhost on  "$CA" "$CRL_SERVER";
 } > "$WORK/blocks"
 cat > "$WORK/locations" <<'LOC'
 
@@ -144,6 +151,24 @@ cat > "$WORK/locations" <<'LOC'
         location = /systemca.txt {
             auth_ldap "systemca";
             auth_ldap_servers systemca;
+            alias ROOT/t.txt;
+        }
+
+        location = /bychain.txt {
+            auth_ldap "bychain";
+            auth_ldap_servers bychain;
+            alias ROOT/t.txt;
+        }
+
+        location = /crlok.txt {
+            auth_ldap "crlok";
+            auth_ldap_servers crlok;
+            alias ROOT/t.txt;
+        }
+
+        location = /crlbad.txt {
+            auth_ldap "crlbad";
+            auth_ldap_servers crlbad;
             alias ROOT/t.txt;
         }
 LOC
@@ -171,6 +196,32 @@ out=$(refused -u alice:alicepw "http://127.0.0.1:$PORT/systemca.txt")
 echo "  $out"
 [ "$out" = 500 ] ||
 	note "a server with no ca of its own accepted the one another server named, got $out"
+
+echo "== a revocation list that revokes nothing lets the certificate through"
+out=$(code -u alice:alicepw "http://127.0.0.1:$PORT/crlok.txt")
+echo "  $out"
+[ "$out" = 200 ] ||
+	note "an empty revocation list must not refuse anything, got $out"
+
+echo "== and one that revokes this certificate does not"
+# Same authority, same certificate, same name: the only difference is the
+# list.  Without it the pair says nothing, which is why there are two.
+out=$(refused -u alice:alicepw "http://127.0.0.1:$PORT/crlbad.txt")
+echo "  $out"
+[ "$out" = 500 ] ||
+	note "a revoked certificate has to end in 500, got $out"
+grep -q "did not verify" "$WORK/logs/trusted.log" ||
+	note "the error log does not say that the certificate did not verify"
+
+echo "== chain, trusted ca, reached under an address it does not name"
+# Same certificate and same address as the case below, which "on" refuses:
+# "chain" asks for the chain and leaves the name alone, and that is the
+# setting for a directory whose certificate names something else -- or names
+# it only in its common name, which is not held against anything any more.
+out=$(code -u alice:alicepw "http://127.0.0.1:$PORT/bychain.txt")
+echo "  $out"
+[ "$out" = 200 ] ||
+	note "chain verifies the chain and not the name, so this has to pass, got $out"
 
 echo "== on, trusted ca, reached under an address the certificate does not name"
 out=$(refused -u alice:alicepw "http://127.0.0.1:$PORT/byaddr.txt")

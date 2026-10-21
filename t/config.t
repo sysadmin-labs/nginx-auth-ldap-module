@@ -167,5 +167,5 @@ unknown directive "requre"
     }
 --- must_die
 --- error_log
-takes "on" or "off"
+takes "on", "chain" or "off"
 

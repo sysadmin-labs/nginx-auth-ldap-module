@@ -1,0 +1,38 @@
+name: Resolve
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  schedule:
+    - cron: '59 9 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    name: a name that answers with something else
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # The addresses of a directory used to be the ones the configuration
+    # resolved, so a directory that moved was reached again on the next
+    # reload.  Whether the name is asked again is only visible against a
+    # nameserver whose answer can be changed under a running nginx.
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup
+        with:
+          test-nginx: 'false'
+          packages: libldap2-dev slapd ldap-utils
+
+      - name: Build nginx
+        run: |
+          . .github/versions.env
+          ci/build.sh "$NGINX_VERSION" "$HOME/nginx"
+
+      - name: The answer changes, and nothing is reloaded
+        run: ci/resolve.sh "$HOME/nginx/sbin/nginx"
