@@ -135,3 +135,37 @@ No user attribute specified
 --- must_die
 --- error_log
 names no host
+
+
+
+=== TEST 9: a directive the block does not know is refused
+--- http_config
+    ldap_server good {
+        url ldap://127.0.0.1:389/ou=people,dc=test,dc=local?uid?sub?(objectClass=*);
+        requre valid_user;
+    }
+--- config
+    location = /t {
+        return 200 ok;
+    }
+--- must_die
+--- error_log
+unknown directive "requre"
+
+
+
+=== TEST 10: a flag that is neither on nor off is refused
+--- http_config
+    ldap_server good {
+        url ldap://127.0.0.1:389/ou=people,dc=test,dc=local?uid?sub?(objectClass=*);
+        require valid_user;
+        ssl_check_cert maybe;
+    }
+--- config
+    location = /t {
+        return 200 ok;
+    }
+--- must_die
+--- error_log
+takes "on" or "off"
+

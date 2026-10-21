@@ -487,7 +487,14 @@ ngx_http_auth_ldap_ldap_server(ngx_conf_t *cf, ngx_command_t *dummy, void *conf)
 
     value = cf->args->elts;
 
-    /* TODO: Add more validation */
+    /* Everything this block holds is a name and a value, and most of the
+       branches below read the value without looking. */
+    if (cf->args->nelts < 2) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "http_auth_ldap: \"%V\" takes a value.", &value[0]);
+        return NGX_CONF_ERROR;
+    }
+
     if (ngx_strcmp(value[0].data, "url") == 0) {
         return ngx_http_auth_ldap_parse_url(cf, server);
     } else if (ngx_strcmp(value[0].data, "binddn") == 0) {
@@ -496,8 +503,17 @@ ngx_http_auth_ldap_ldap_server(ngx_conf_t *cf, ngx_command_t *dummy, void *conf)
         server->bind_dn_passwd = value[1];
     } else if (ngx_strcmp(value[0].data, "group_attribute") == 0) {
         server->group_attribute = value[1];
-    } else if (ngx_strcmp(value[0].data, "group_attribute_is_dn") == 0 && ngx_strcmp(value[1].data, "on") == 0) {
-        server->group_attribute_dn = 1;
+    } else if (ngx_strcmp(value[0].data, "group_attribute_is_dn") == 0) {
+        if (ngx_strcmp(value[1].data, "on") == 0) {
+            server->group_attribute_dn = 1;
+        } else if (ngx_strcmp(value[1].data, "off") == 0) {
+            server->group_attribute_dn = 0;
+        } else {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                "http_auth_ldap: \"group_attribute_is_dn\" takes \"on\" or "
+                "\"off\", not \"%V\".", &value[1]);
+            return NGX_CONF_ERROR;
+        }
     } else if (ngx_strcmp(value[0].data, "require") == 0) {
         return ngx_http_auth_ldap_parse_require(cf, server);
     } else if (ngx_strcmp(value[0].data, "satisfy") == 0) {
@@ -518,18 +534,29 @@ ngx_http_auth_ldap_ldap_server(ngx_conf_t *cf, ngx_command_t *dummy, void *conf)
             return NGX_CONF_ERROR;
         }
         server->connections = i;
-    } else if (ngx_strcmp(value[0].data, "ssl_check_cert") == 0  && ngx_strcmp(value[1].data, "on") == 0) {
+    } else if (ngx_strcmp(value[0].data, "ssl_check_cert") == 0) {
+      if (ngx_strcmp(value[1].data, "on") == 0) {
       #if OPENSSL_VERSION_NUMBER >= 0x10002000
-      server->ssl_check_cert = 1;
+        server->ssl_check_cert = 1;
       #else
       #if GNUC > 4
       #warning "http_auth_ldap: Compiling with OpenSSL < 1.0.2, certificate verification will be unavailable. OPENSSL_VERSION_NUMBER == " XSTR(OPENSSL_VERSION_NUMBER)
       #endif
-      ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-        "http_auth_ldap: 'ssl_cert_check': cannot verify remote certificate's domain name because "
-        "your version of OpenSSL is too old. "
-        "Please install OpenSSL >= 1.02 and recompile nginx.");
+        /* refused rather than logged: a configuration that asks for the
+           certificate to be checked must not come up without checking it */
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+          "http_auth_ldap: \"ssl_check_cert on\" needs OpenSSL 1.0.2 or "
+          "newer, and nginx was built against an older one.");
+        return NGX_CONF_ERROR;
       #endif
+      } else if (ngx_strcmp(value[1].data, "off") == 0) {
+        server->ssl_check_cert = 0;
+      } else {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+          "http_auth_ldap: \"ssl_check_cert\" takes \"on\" or \"off\", not "
+          "\"%V\".", &value[1]);
+        return NGX_CONF_ERROR;
+      }
     } else if (ngx_strcmp(value[0].data, "ssl_ca_dir") == 0) {
       server->ssl_ca_dir = value[1];
     } else if (ngx_strcmp(value[0].data, "ssl_ca_file") == 0) {
@@ -541,6 +568,16 @@ ngx_http_auth_ldap_ldap_server(ngx_conf_t *cf, ngx_command_t *dummy, void *conf)
     else CONF_MSEC_VALUE(cf,value,server,request_timeout)
     else if (ngx_strcmp(value[0].data, "include") == 0) {
         return ngx_conf_include(cf, dummy, conf);
+    } else {
+        /*
+         * An unknown line used to be taken and dropped.  A require rule with
+         * a typo in it therefore left a server with no rule at all, which
+         * lets in everyone who can bind, and said nothing about it.
+         */
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "http_auth_ldap: unknown directive \"%V\" in an ldap_server "
+            "block.", &value[0]);
+        return NGX_CONF_ERROR;
     }
 
     rv = NGX_CONF_OK;
@@ -2576,6 +2613,11 @@ ngx_http_auth_ldap_search(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *ctx)
             r->pool,
             (ludpp->lud_filter != NULL ? ngx_strlen(ludpp->lud_filter) : ngx_strlen("(objectClass=*)")) +
             ngx_strlen("(&(=))") + ngx_strlen(ludpp->lud_attrs[0]) + user.len + 1);
+        if (filter == NULL) {
+            ctx->outcome = OUTCOME_ERROR;
+            ngx_http_auth_ldap_return_connection(ctx->c);
+            return NGX_ERROR;
+        }
         ngx_sprintf(filter, "(&%s(%s=%V))%Z",
                 ludpp->lud_filter != NULL ? ludpp->lud_filter : "(objectClass=*)",
                 ludpp->lud_attrs[0], &user);
