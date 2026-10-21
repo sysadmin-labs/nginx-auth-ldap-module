@@ -1,8 +1,9 @@
 # Changelog
 
-## v0.1.0 (2026-10-21)
+## v0.2.0 (2026-10-21)
 
-First release of this fork, from upstream `241200e`.
+First release of this fork, from upstream `241200e`.  The number follows
+upstream's own, whose single tag is `v0.1`.
 
 ### Fixed
 

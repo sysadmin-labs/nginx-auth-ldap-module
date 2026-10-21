@@ -7,6 +7,11 @@
 # invalid read, no uninitialised value, no conditional jump.  Anything that
 # was in here beyond them suppressed something that never happens.
 #
+# Two things read this file: Test::Nginx, which looks for it by that name in
+# the directory the suite runs from, and the valgrind workflow, which hands
+# it to the wrapped driver with --suppressions.  One file for both, because
+# a second copy is a second thing to keep right.
+#
 # Note which cycle function they come through: Test::Nginx runs nginx with
 # master_process off, so everything here is the single-process path.  An
 # entry for the master's own path would never be reached from this suite

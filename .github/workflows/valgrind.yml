@@ -47,7 +47,7 @@ jobs:
         run: |
           # t/ reaches the configuration parser; this walks a request
           # through the module, which is where a leak per request would be.
-          AUTH_WRAP="valgrind --leak-check=full --show-leak-kinds=definite,indirect,possible --num-callers=30 --error-exitcode=0 --suppressions=$PWD/ci/valgrind.suppress --log-file=$PWD/vg-auth.log" \
+          AUTH_WRAP="valgrind --leak-check=full --show-leak-kinds=definite,indirect,possible --num-callers=30 --error-exitcode=0 --suppressions=$PWD/valgrind.suppress --log-file=$PWD/vg-auth.log" \
             ci/auth.sh "$HOME/nginx/sbin/nginx"
           # valgrind writes a summary whether or not it found anything, so
           # its absence means valgrind did not run and the gate is blind
