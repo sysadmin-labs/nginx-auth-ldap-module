@@ -1,0 +1,37 @@
+name: LDAPS
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  schedule:
+    - cron: '59 9 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ldaps:
+    name: a certificate that verifies, and three that do not count
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # The module speaks TLS to the directory when the url says ldaps://, and
+    # what "ssl_check_cert on" is worth is only visible against a server
+    # whose certificate can be made to fail on purpose.
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup
+        with:
+          test-nginx: 'false'
+          packages: libldap2-dev slapd ldap-utils
+
+      - name: Build nginx
+        run: |
+          . .github/versions.env
+          ci/build.sh "$NGINX_VERSION" "$HOME/nginx"
+
+      - name: Trusted, untrusted, and a name that does not match
+        run: ci/ldaps.sh "$HOME/nginx/sbin/nginx"

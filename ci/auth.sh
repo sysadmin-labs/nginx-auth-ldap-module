@@ -10,7 +10,8 @@
 # usage: ci/auth.sh <nginx binary>
 #
 # Set AUTH_LOAD_MODULE to the path of ngx_http_auth_ldap_module.so to test a
-# loadable build, AUTH_PRELOAD to a library that is put in front of it.
+# loadable build, AUTH_PRELOAD to a library that is put in front of it, and
+# AUTH_LOG_LEVEL to raise the error log above info.
 
 set -eu
 
@@ -49,7 +50,7 @@ daemon on;
 master_process on;
 worker_processes 1;
 pid $WORK/logs/nginx.pid;
-error_log $WORK/logs/error.log info;
+error_log $WORK/logs/error.log ${AUTH_LOG_LEVEL:-info};
 events { worker_connections 64; }
 http {
     access_log off;
@@ -75,6 +76,24 @@ http {
         connections 2;
     }
 
+    ldap_server vargroup {
+        url ldap://127.0.0.1:$LDAP_PORT/ou=people,dc=test,dc=local?uid?sub?(objectClass=inetOrgPerson);
+        binddn "cn=admin,dc=test,dc=local";
+        binddn_passwd secret;
+        group_attribute member;
+        group_attribute_is_dn on;
+        satisfy all;
+        require valid_user;
+        require group "cn=\$http_x_group,ou=groups,dc=test,dc=local";
+        connections 2;
+    }
+
+    ldap_server vardn {
+        url ldap://127.0.0.1:$LDAP_PORT/ou=people,dc=test,dc=local?uid?sub?(objectClass=inetOrgPerson);
+        require valid_user "uid=\$remote_user,ou=people,dc=test,dc=local";
+        connections 2;
+    }
+
     server {
         listen 127.0.0.1:$PORT;
         root $WORK/html;
@@ -87,6 +106,18 @@ http {
         location = /anyone.txt {
             auth_ldap "Anyone";
             auth_ldap_servers anyone;
+        }
+
+        location = /vargroup.txt {
+            auth_ldap "Group from a header";
+            auth_ldap_servers vargroup;
+            alias $WORK/html/staff.txt;
+        }
+
+        location = /vardn.txt {
+            auth_ldap "DN from the login name";
+            auth_ldap_servers vardn;
+            alias $WORK/html/staff.txt;
         }
 
         location = /open.txt {
@@ -163,6 +194,32 @@ echo "  * with a valid password: $out"
 out=$(code -u 'alice)(objectClass=*:alicepw' "http://127.0.0.1:$PORT/staff.txt")
 echo "  a name that closes the filter: $out"
 [ "$out" = 401 ] || note "a name with filter syntax was accepted, got $out"
+
+echo "== a group that comes from a header is a name, not a filter"
+out=$(code -u alice:alicepw -H 'X-Group: staff' "http://127.0.0.1:$PORT/vargroup.txt")
+echo "  the group she is in: $out"
+[ "$out" = 200 ] || note "alice is in staff and has to pass, got $out"
+out=$(code -u alice:alicepw -H 'X-Group: *' "http://127.0.0.1:$PORT/vargroup.txt")
+echo "  a wildcard as the group: $out"
+[ "$out" = 401 ] || note "a wildcard as a group name was accepted, got $out"
+out=$(code -u alice:alicepw -H 'X-Group: nosuch)(objectClass=*' "http://127.0.0.1:$PORT/vargroup.txt")
+echo "  a group that closes the filter: $out"
+[ "$out" = 401 ] || note "a group with filter syntax was accepted, got $out"
+
+echo "== a bind DN built from the login name keeps its shape"
+# What is asserted here is the refusal.  The matching case is not, and the
+# reason is a defect of the module that this fork has not fixed yet: a
+# request through one ldap_server leaves the next request through a server
+# with "require valid_user <dn>" with an invalid-credentials answer for
+# credentials that are correct.  Three requests reproduce it, and the
+# imported state behaves the same way:
+#
+#     /vardn.txt -> 200, /staff.txt -> 200, /vardn.txt -> 401
+out=$(code -u 'alice,ou=people,dc=test,dc=local,x=y:alicepw' "http://127.0.0.1:$PORT/vardn.txt")
+echo "  a name with commas in it: $out"
+[ "$out" = 401 ] || note "a login name that adds relative names was accepted, got $out"
+grep -q "is not shaped like its configuration" "$WORK/logs/error.log" ||
+	note "the error log does not say that the bind DN was refused"
 
 echo "== a location without auth_ldap stays open"
 out=$(code "http://127.0.0.1:$PORT/open.txt")

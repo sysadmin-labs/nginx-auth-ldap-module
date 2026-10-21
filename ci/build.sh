@@ -82,8 +82,11 @@ if [ -n "${CI_LD_OPT:-}" ]; then
 fi
 
 echo "== configure ($MODE)"
-./configure --prefix="$PREFIX" --with-debug "$how=$SRC" "$@" \
-	> "$WORK/configure-$NGINX.log" 2>&1 ||
+# --with-http_ssl_module is required, and not for the test suite: the
+# module's own ldaps:// support is compiled only when nginx was configured
+# with OpenSSL, and without it "url ldaps://..." is refused at startup.
+./configure --prefix="$PREFIX" --with-debug --with-http_ssl_module \
+	"$how=$SRC" "$@" > "$WORK/configure-$NGINX.log" 2>&1 ||
 	{ tail -30 "$WORK/configure-$NGINX.log"; exit 1; }
 
 echo "== make -j$JOBS"
