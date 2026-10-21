@@ -39,6 +39,10 @@ jobs:
           TEST_NGINX_USE_VALGRIND=1 TEST_NGINX_NO_SHUFFLE=1 \
             TEST_NGINX_BINARY="$HOME/nginx/sbin/nginx" \
             prove -r t/ 2>&1 | tee valgrind.log
+          # A clean run says nothing at all, which looks exactly like a run
+          # that never happened.  So ask valgrind itself whether it was
+          # there, with a binary it has to refuse to run.
+          valgrind --version | tee -a valgrind.log
 
       - name: No findings allowed
         run: |

@@ -59,7 +59,11 @@ jobs:
           # walks the module at run time, which is what the sanitizers are
           # here for.
           ASAN_OPTIONS="$ASAN_OPTIONS:abort_on_error=0" \
-            ci/auth.sh "$HOME/nginx/sbin/nginx" 2>&1 | tee -a sanitizer.log
+            AUTH_LOG_LEVEL=info ci/auth.sh "$HOME/nginx/sbin/nginx" 2>&1 |
+            tee -a sanitizer.log
+          # nginx writes what the sanitizers say into its own error log, not
+          # to the pipe above, so that log belongs in the verdict as well
+          cat ci-work/auth/logs/error.log >> sanitizer.log
 
       - name: No findings allowed
         run: |

@@ -1,7 +1,7 @@
 # created by the test suite
 t/servroot/
 
-# created by ci/build.sh, ci/reload.sh and ci/expiry.sh
+# created by ci/build.sh, ci/reload.sh and the drivers under ci/
 ci-work/
 
 # leftovers from patch(1)
