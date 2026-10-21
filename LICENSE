@@ -1,3 +1,16 @@
+The module in src/ is Valery Komarov's, Jiri Hruska's and Victor Hahn
+Castell's, under the two-clause BSD licence below.  Upstream keeps that text
+in a file of its own, wrapped in C comment markers; the wording is
+reproduced here unaltered, without the markers.
+
+This is a fork, so the file in src/ is no longer only theirs: every fix the
+changelog lists is a change to their code.  Those changes, and the build and
+test scaffolding that came with them -- ci/, t/, .github/, config and the
+documentation -- are not their work and are covered by the same terms, held
+by:
+
+    Copyright (c) 2026, Jochen Neumeister <joneum@FreeBSD.org>
+
 Copyright (C) 2011-2013 Valery Komarov <komarov@valerka.net>
 Copyright (C) 2013 Jiri Hruska <jirka@fud.cz>
 Copyright (C) 2015-2016 Victor Hahn Castell <victor.hahn@flexoptix.net>

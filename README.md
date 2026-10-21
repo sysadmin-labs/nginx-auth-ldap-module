@@ -231,7 +231,8 @@ matrix with a `connect(2)` that comes back already connected, and
 ## Credits and license
 
 The module is the work of Valery Komarov, Jiri Hruska and Victor Hahn
-Castell, BSD 2-Clause, see [LICENSE](LICENSE).  This fork keeps that licence.
+Castell, BSD 2-Clause.  This fork keeps that licence, and
+[LICENSE](LICENSE) says which part of the result is whose.
 
 Several of the fixes were proposed upstream before they were made here, and
 those proposals are the work of their authors: the escaping of filter values
