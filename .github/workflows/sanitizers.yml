@@ -68,7 +68,10 @@ jobs:
           cat ci-work/auth/logs/error.log >> sanitizer.log
           ASAN_OPTIONS="detect_leaks=1:abort_on_error=0" \
             ci/ldaps.sh "$HOME/nginx/sbin/nginx" 2>&1 | tee -a sanitizer.log
-          cat ci-work/ldaps/logs/error.log >> sanitizer.log
+          # the two configurations that driver runs write their own logs;
+          # logs/error.log stays empty there
+          cat ci-work/ldaps/logs/trusted.log ci-work/ldaps/logs/untrusted.log \
+            >> sanitizer.log
 
       - name: No findings allowed
         run: |

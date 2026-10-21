@@ -47,12 +47,19 @@ jobs:
         run: |
           # t/ reaches the configuration parser; this walks a request
           # through the module, which is where a leak per request would be.
-          AUTH_WRAP="valgrind --leak-check=full --show-leak-kinds=definite,indirect --num-callers=30 --error-exitcode=0 --suppressions=$PWD/ci/valgrind.suppress --log-file=$PWD/vg-auth.log" \
+          AUTH_WRAP="valgrind --leak-check=full --show-leak-kinds=definite,indirect,possible --num-callers=30 --error-exitcode=0 --suppressions=$PWD/ci/valgrind.suppress --log-file=$PWD/vg-auth.log" \
             ci/auth.sh "$HOME/nginx/sbin/nginx"
           # valgrind writes a summary whether or not it found anything, so
           # its absence means valgrind did not run and the gate is blind
           grep -q "ERROR SUMMARY" vg-auth.log || {
             echo "valgrind wrote no summary, so it did not run" >&2
+            exit 1
+          }
+          # And the summary is the verdict: counting on a list of phrases
+          # lets through every kind of finding that is not on the list.
+          grep -q "ERROR SUMMARY: 0 errors" vg-auth.log || {
+            echo "valgrind counted findings of its own:" >&2
+            grep -E "ERROR SUMMARY|lost: " vg-auth.log >&2
             exit 1
           }
           sed -n '1,200p' vg-auth.log
