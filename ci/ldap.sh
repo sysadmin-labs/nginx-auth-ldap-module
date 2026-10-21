@@ -164,6 +164,27 @@ sn: Example
 mail: bob@test.local
 userPassword: bobpw
 
+dn: uid=a*e,ou=people,dc=test,dc=local
+objectClass: inetOrgPerson
+uid: a*e
+cn: Star
+sn: Star
+mail: star@test.local
+userPassword: astarpw
+
+dn: uid=carol,ou=people,dc=test,dc=local
+objectClass: inetOrgPerson
+uid: carol
+cn: Carol
+sn: Carol
+mail: carol@test.local
+userPassword: carolpw
+
+dn: cn=byname,ou=groups,dc=test,dc=local
+objectClass: organizationalRole
+cn: byname
+description: alice
+
 dn: cn=staff,ou=groups,dc=test,dc=local
 objectClass: groupOfNames
 cn: staff

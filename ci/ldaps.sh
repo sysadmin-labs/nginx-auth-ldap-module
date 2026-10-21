@@ -82,7 +82,14 @@ CONF
 
 start() {
 	"$NGINX" -p "$WORK" -c "$1"
-	sleep 1
+	# wait for the port rather than for a second: a fixed wait is what
+	# makes a driver flap on a loaded machine
+	waited=0
+	until curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$PORT/nothing"; do
+		waited=$((waited + 1))
+		[ "$waited" -lt 60 ] || { echo "nginx did not come up" >&2; exit 1; }
+		sleep 1
+	done
 }
 
 stop() {
@@ -100,11 +107,12 @@ trap cleanup EXIT INT TERM
 
 code() { curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$@" || echo 000; }
 
-# A server whose certificate is refused never has a usable connection, so the
-# request waits for one and the answer comes when the request times out.  The
-# point of these two cases is that nobody gets in and that the log says why,
-# not which code the wait ends in.
-refused() { curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$@" || echo 000; }
+# A server whose certificate is refused never has a usable connection, so
+# the request waits for one until its own request_timeout runs out, ten
+# seconds by default, and is then answered 500: the module could not decide,
+# which is not the same as a wrong password.  That wait is why these two
+# cases get a longer leash than the rest.
+refused() { curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$@" || echo 000; }
 
 # --- the three cases that share one nginx, and so one certificate store
 {
@@ -149,7 +157,8 @@ echo "  $out"
 echo "== on, trusted ca, reached under an address the certificate does not name"
 out=$(refused -u alice:alicepw "http://127.0.0.1:$PORT/byaddr.txt")
 echo "  $out"
-[ "$out" != 200 ] || note "a name that does not match has to be refused, got $out"
+[ "$out" = 500 ] ||
+	note "a name that does not match has to end in 500, got $out"
 grep -q "names neither" "$WORK/logs/trusted.log" ||
 	note "the error log does not say that the name did not match"
 
@@ -172,7 +181,8 @@ start "$WORK/conf/untrusted.conf"
 echo "== on, and the ca of the server is trusted by nobody"
 out=$(refused -u alice:alicepw "http://127.0.0.1:$PORT/untrusted.txt")
 echo "  $out"
-[ "$out" != 200 ] || note "an unverifiable certificate has to be refused, got $out"
+[ "$out" = 500 ] ||
+	note "an unverifiable certificate has to end in 500, got $out"
 grep -q "did not verify" "$WORK/logs/untrusted.log" ||
 	note "the error log does not say that the certificate did not verify"
 
