@@ -102,6 +102,15 @@ typedef struct {
     ngx_msec_t request_timeout;
     ngx_queue_t free_connections;
     ngx_queue_t waiting_requests;
+
+    /*
+     * The connections this worker made, in the order it made them, so that
+     * they can all be closed when it leaves.  Deliberately behind
+     * free_connections: the server hash covers the struct only up to that
+     * field, and a field in front of it would change which servers count as
+     * the same one.
+     */
+    ngx_array_t *conns;         /* of ngx_http_auth_ldap_connection_t * */
 } ngx_http_auth_ldap_server_t;
 
 typedef struct {
@@ -210,6 +219,7 @@ static char * ngx_http_auth_ldap_init_main_conf(ngx_conf_t *cf, void *parent);
 static void * ngx_http_auth_ldap_create_loc_conf(ngx_conf_t *);
 static char * ngx_http_auth_ldap_merge_loc_conf(ngx_conf_t *, void *, void *);
 static ngx_int_t ngx_http_auth_ldap_init_worker(ngx_cycle_t *cycle);
+static void ngx_http_auth_ldap_exit_worker(ngx_cycle_t *cycle);
 static ngx_int_t ngx_http_auth_ldap_init(ngx_conf_t *cf);
 static ngx_int_t ngx_http_auth_ldap_init_cache(ngx_cycle_t *cycle);
 static void ngx_http_auth_ldap_close_connection(ngx_http_auth_ldap_connection_t *c);
@@ -311,7 +321,7 @@ ngx_module_t ngx_http_auth_ldap_module = {
     ngx_http_auth_ldap_init_worker,      /* init process */
     NULL,                                /* init thread */
     NULL,                                /* exit thread */
-    NULL,                                /* exit process */
+    ngx_http_auth_ldap_exit_worker,      /* exit process */
     NULL,                                /* exit master */
     NGX_MODULE_V1_PADDING
 };
@@ -905,6 +915,51 @@ ngx_http_auth_ldap_init_worker(ngx_cycle_t *cycle)
     }
 
     return NGX_OK;
+}
+
+/**
+ * Close what this worker opened, before nginx looks for leftovers.
+ *
+ * The connections live for as long as the worker does, and the pool cleanup
+ * that frees them runs when the cycle pool is destroyed -- which is after
+ * nginx has already walked its connection array and written "open socket
+ * left in connection" for every one of them, once per reload.  This handler
+ * runs before that walk.
+ */
+static void
+ngx_http_auth_ldap_exit_worker(ngx_cycle_t *cycle)
+{
+    ngx_uint_t i, j;
+    ngx_http_auth_ldap_connection_t **cp;
+    ngx_http_auth_ldap_main_conf_t *halmcf;
+    ngx_http_auth_ldap_server_t *server;
+
+    if (ngx_process != NGX_PROCESS_SINGLE && ngx_process != NGX_PROCESS_WORKER) {
+        return;
+    }
+
+    halmcf = ngx_http_cycle_get_module_main_conf(cycle, ngx_http_auth_ldap_module);
+    if (halmcf == NULL || halmcf->servers == NULL) {
+        return;
+    }
+
+    for (i = 0; i < halmcf->servers->nelts; i++) {
+        server = &((ngx_http_auth_ldap_server_t *) halmcf->servers->elts)[i];
+        if (server->conns == NULL) {
+            continue;
+        }
+
+        cp = server->conns->elts;
+        for (j = 0; j < server->conns->nelts; j++) {
+            if (cp[j]->reconnect_event.timer_set) {
+                ngx_del_timer(&cp[j]->reconnect_event);
+            }
+
+            /* so that closing does not schedule a reconnect on the way out */
+            cp[j]->state = STATE_DISCONNECTED;
+            ngx_http_auth_ldap_close_connection(cp[j]);
+        }
+    }
 }
 
 /**
@@ -1766,7 +1821,7 @@ ngx_http_auth_ldap_reconnect_handler(ngx_event_t *ev)
 static ngx_int_t
 ngx_http_auth_ldap_init_connections(ngx_cycle_t *cycle)
 {
-    ngx_http_auth_ldap_connection_t *c;
+    ngx_http_auth_ldap_connection_t *c, **cp;
     ngx_http_auth_ldap_main_conf_t *halmcf;
     ngx_http_auth_ldap_server_t *server;
     ngx_pool_cleanup_t *cleanup;
@@ -1788,6 +1843,12 @@ ngx_http_auth_ldap_init_connections(ngx_cycle_t *cycle)
         ngx_queue_init(&server->waiting_requests);
         if (server->connections <= 1) {
             server->connections = 1;
+        }
+
+        server->conns = ngx_array_create(cycle->pool, server->connections,
+            sizeof(ngx_http_auth_ldap_connection_t *));
+        if (server->conns == NULL) {
+            return NGX_ERROR;
         }
 
         for (j = 0; j < server->connections; j++) {
@@ -1817,6 +1878,12 @@ ngx_http_auth_ldap_init_connections(ngx_cycle_t *cycle)
             c->pool = cycle->pool;
             c->ssl = &halmcf->ssl;
 #endif
+
+            cp = ngx_array_push(server->conns);
+            if (cp == NULL) {
+                return NGX_ERROR;
+            }
+            *cp = c;
 
             ngx_http_auth_ldap_connect(c);
         }
