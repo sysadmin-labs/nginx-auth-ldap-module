@@ -26,7 +26,7 @@ jobs:
 
       - uses: ./.github/actions/setup
         with:
-          packages: libldap2-dev
+          packages: libldap2-dev valgrind
 
       - name: Build nginx
         run: |

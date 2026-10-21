@@ -48,6 +48,16 @@ for d in /usr/lib/ldap /usr/lib64/openldap /usr/local/libexec/openldap; do
 	[ -f "$d/back_mdb.so" ] && { modules=$d; break; }
 done
 
+# Debian and Ubuntu ship slapd behind an AppArmor profile that lets it read
+# /etc/ldap and write /var/lib/ldap and little else.  A slapd that keeps its
+# configuration and its database under this working directory is denied both
+# and never comes up, with nothing in its own log to say so.  Where the
+# profile is there and this user may unload it, it goes for the run; where
+# either is not the case, nothing happens.
+if [ -e /etc/apparmor.d/usr.sbin.slapd ] && command -v apparmor_parser > /dev/null 2>&1; then
+	sudo -n apparmor_parser -R /etc/apparmor.d/usr.sbin.slapd > /dev/null 2>&1 || true
+fi
+
 # a slapd from an earlier run would still hold the port and the database
 pkill -f "slapd -f $WORK/slapd.conf" 2> /dev/null || true
 sleep 1
@@ -130,8 +140,15 @@ while [ $i -lt 50 ]; do
 	i=$((i + 1))
 	sleep 0.2
 done
-[ $i -lt 50 ] || { echo "slapd did not come up, see $WORK/slapd.log" >&2
-		   tail -5 "$WORK/slapd.log" >&2; exit 1; }
+[ $i -lt 50 ] || {
+	echo "slapd did not come up; its log follows" >&2
+	if [ -s "$WORK/slapd.log" ]; then
+		cat "$WORK/slapd.log" >&2
+	else
+		echo "  (the log is empty, so it did not get as far as writing one)" >&2
+	fi
+	exit 1
+}
 
 cat > "$WORK/test.ldif" <<'LDIF'
 dn: dc=test,dc=local

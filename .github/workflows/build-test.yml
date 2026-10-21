@@ -70,6 +70,8 @@ jobs:
       - uses: actions/checkout@v7
 
       - uses: ./.github/actions/setup
+        with:
+          packages: libldap2-dev
 
       - name: Build the module as a loadable object
         run: ci/build.sh '${{ needs.pins.outputs.version }}' "$HOME/nginx" dynamic
