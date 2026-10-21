@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.2.3 (2026-10-21)
+
+### Changed
+
+- The filter injection is no longer called CVE-2020-14013 in the source.
+  Upstream pull request 239 carries that number in its title and has since
+  2020, but no register knows the id: the NVD returns no result for it and
+  MITRE answers `CVE_RECORD_DNE`.  The changelog still names it, together
+  with that finding, so a search for the number reaches this fork without
+  anyone reading a registration into it.
+
 ## v0.2.2 (2026-10-21)
 
 ### Fixed
