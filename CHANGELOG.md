@@ -1,5 +1,20 @@
 # Changelog
 
+## v0.2.2 (2026-10-21)
+
+### Fixed
+
+- The bind DN that `require valid_user` builds would not compile where
+  nginx builds with clang.  `written` is read after a branch that assigns
+  it only when the DN parsed, which holds but which the compiler cannot
+  see; nginx makes `-Wconditional-uninitialized` an error, so the build
+  stopped on FreeBSD.
+
+### Added
+
+- A build with clang, because nginx picks the warnings it turns on from the
+  compiler.  The gcc matrix cannot see that class of warning at all.
+
 ## v0.2.1 (2026-10-21)
 
 What the first release of this fork wrote down as not fixed, fixed.

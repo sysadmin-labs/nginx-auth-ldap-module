@@ -3189,7 +3189,7 @@ ngx_http_auth_ldap_build_bind_dn(ngx_http_request_t *r,
 {
     ngx_str_t   value, built;
     LDAPDN      parsed;
-    char       *written;
+    char       *written = NULL;
     ngx_uint_t  i;
     ngx_int_t   rc;
 

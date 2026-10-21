@@ -60,6 +60,27 @@ jobs:
           TEST_NGINX_NO_SHUFFLE=1 \
             TEST_NGINX_BINARY="$HOME/nginx/sbin/nginx" prove -r t/
 
+  clang:
+    name: clang
+    needs: pins
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # nginx picks the warnings it turns on from the compiler and makes them
+    # errors.  -Wconditional-uninitialized is clang's, gcc has nothing like
+    # it, so a gcc-only matrix lets that whole class through to whoever
+    # builds the module on FreeBSD.
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup
+        with:
+          test-nginx: 'false'
+          packages: libldap2-dev clang
+
+      - name: Build with clang
+        run: CC=clang ci/build.sh '${{ needs.pins.outputs.version }}' "$HOME/nginx"
+
   dynamic:
     name: loadable module
     needs: pins

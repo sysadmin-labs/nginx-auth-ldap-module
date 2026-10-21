@@ -10,6 +10,10 @@
 #     static    the module built into the binary (the default)
 #     dynamic   the module built as a loadable object
 #
+# CC picks the compiler, which also picks the warnings nginx turns on: its
+# clang set holds -Wconditional-uninitialized, which gcc has no equivalent
+# for, and it is an error there.
+#
 # nginx lands in $CI_WORK, ./ci-work by default, and is reused on a
 # second run.  A warning from this module's own source fails the build.
 
@@ -88,6 +92,10 @@ if [ -n "${CI_CC_OPT:-}" ]; then
 fi
 if [ -n "${CI_LD_OPT:-}" ]; then
 	set -- "$@" --with-ld-opt="$CI_LD_OPT"
+fi
+
+if [ -n "${CC:-}" ]; then
+	set -- "$@" --with-cc="$CC"
 fi
 
 echo "== configure ($MODE)"
