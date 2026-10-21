@@ -69,8 +69,8 @@ upstream's own, whose single tag is `v0.1`.
   it stood.  A name of `*` therefore matched the first user in the directory,
   which the module then bound with the password it was handed: whoever held
   one valid password could authenticate under any name, and a group
-  requirement went the same way.  That is CVE-2020-14013, open upstream since
-  2020 (pull request 239, onovy).
+  requirement went the same way.  Reported upstream in June 2020 and open
+  there since (pull request 239, onovy).
 - A connection that was already established when `ngx_event_connect_peer()`
   returned left the module waiting for a write event that nginx does not
   register in that case, so the connection never became usable and every

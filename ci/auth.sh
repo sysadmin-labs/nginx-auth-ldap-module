@@ -109,7 +109,7 @@ http {
 
     # The members of cn=byname are login names, not DNs, so the name the
     # request sends goes into the group filter as a value of its own.  That
-    # is the other half of CVE-2020-14013.
+    # is the other half of the injection.
     ldap_server byloginname {
         url ldap://127.0.0.1:$LDAP_PORT/ou=people,dc=test,dc=local?uid?sub?(objectClass=inetOrgPerson);
         binddn "cn=admin,dc=test,dc=local";
@@ -295,7 +295,7 @@ echo "  $out"
 echo "== a login name is searched for, not interpreted"
 # An unescaped asterisk makes the search filter match the first user there
 # is, and the module then binds that user with the password it was handed:
-# a login as "*" with any valid password.  That is CVE-2020-14013.
+# a login as "*" with any valid password.  Upstream pull request 239.
 out=$(code -u '*:alicepw' "http://127.0.0.1:$PORT/staff.txt")
 echo "  * with a valid password: $out"
 [ "$out" = 401 ] || note "a wildcard was accepted as a login name, got $out"

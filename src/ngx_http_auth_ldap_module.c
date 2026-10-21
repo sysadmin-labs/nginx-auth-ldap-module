@@ -1035,7 +1035,7 @@ ngx_http_auth_ldap_parse_referral(ngx_conf_t *cf, ngx_http_auth_ldap_server_t *s
  * it.  Written into a filter as it stands, a name containing parentheses,
  * an asterisk or a backslash changes what is searched for instead of being
  * searched for: a group filter becomes one that matches any member, and a
- * user filter one that matches any user (CVE-2020-14013).
+ * user filter one that matches any user.
  *
  * The escaping is left to the library, which keeps the rules of RFC 4515 in
  * one place, and a value that cannot be escaped fails the request rather
