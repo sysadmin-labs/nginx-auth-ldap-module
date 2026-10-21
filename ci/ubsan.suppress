@@ -1,0 +1,16 @@
+# What this hides, and why.
+#
+# nginx 1.30.5 calls ngx_memcpy(dst, NULL, 0) from ngx_pstrdup while
+# ngx_init_cycle copies the prefix strings -- before a single module is
+# loaded.  memcpy is declared __attribute__((nonnull)), so a null source is
+# undefined behaviour even when the length is zero and nothing is read or
+# written.  The stack is nginx's own all the way down:
+#
+#     #0 ngx_pstrdup    src/core/ngx_string.c:84
+#     #1 ngx_init_cycle src/core/ngx_cycle.c:118
+#     #2 main           src/core/nginx.c:293
+#
+# This module appears in none of those reports, and nginx 1.31.6 does not
+# produce them at all.  The entry therefore comes out again as soon as the
+# shipped stable line no longer carries it.
+nonnull-attribute:ngx_pstrdup

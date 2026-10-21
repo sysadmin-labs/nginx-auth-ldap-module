@@ -1,0 +1,86 @@
+name: Build & Test
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  schedule:
+    # Monday morning, so a new nginx release that breaks the module shows
+    # up here and not in somebody's build
+    - cron: '7 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pins:
+    name: pins
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # A matrix is read before any step of its own job runs, so the release
+    # list has to arrive from an earlier job.  Which releases, and why,
+    # is written down in .github/versions.env.
+    outputs:
+      nginx: ${{ steps.read.outputs.nginx }}
+      version: ${{ steps.read.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: read
+        run: .github/scripts/pins.sh >> "$GITHUB_OUTPUT"
+
+  suite:
+    name: nginx ${{ matrix.nginx }}
+    needs: pins
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    strategy:
+      fail-fast: false
+      matrix:
+        nginx: ${{ fromJSON(needs.pins.outputs.nginx) }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup
+        with:
+          packages: libldap2-dev
+
+      - name: Build nginx ${{ matrix.nginx }}
+        run: ci/build.sh '${{ matrix.nginx }}' "$HOME/nginx"
+
+      - name: Run the test suite
+        run: |
+          # The block order is pinned.  Test::Nginx shuffles by default,
+          # and a block that takes the server down is then reported
+          # against whichever block happened to run after it.
+          TEST_NGINX_NO_SHUFFLE=1 \
+            TEST_NGINX_BINARY="$HOME/nginx/sbin/nginx" prove -r t/
+
+  dynamic:
+    name: loadable module
+    needs: pins
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup
+
+      - name: Build the module as a loadable object
+        run: ci/build.sh '${{ needs.pins.outputs.version }}' "$HOME/nginx" dynamic
+
+      - name: Run the test suite against the loaded modules
+        run: |
+          mods=
+          for so in "$HOME"/nginx/modules/*.so; do
+            mods="$mods $so"
+          done
+          echo "loading:$mods"
+          TEST_NGINX_LOAD_MODULES="$mods" \
+            TEST_NGINX_NO_SHUFFLE=1 \
+            TEST_NGINX_BINARY="$HOME/nginx/sbin/nginx" prove -r t/

@@ -1,0 +1,51 @@
+name: Build environment
+description: What a build needs from apt, and Test::Nginx out of a cache.
+
+inputs:
+  packages:
+    description: Extra apt packages this job needs
+    required: false
+    default: ''
+  test-nginx:
+    description: Install Test::Nginx and export PERL5LIB
+    required: false
+    default: 'true'
+
+runs:
+  using: composite
+
+  steps:
+    - name: Install build dependencies
+      shell: bash
+      env:
+        EXTRA_PACKAGES: ${{ inputs.packages }}
+        WANT_TEST_NGINX: ${{ inputs.test-nginx }}
+      run: |
+        packages="libpcre2-dev zlib1g-dev libssl-dev $EXTRA_PACKAGES"
+        if [ "$WANT_TEST_NGINX" = true ]; then
+          packages="$packages cpanminus"
+        fi
+
+        # The bound and the retries live in ci/apt-get.sh, because a step
+        # inside a composite action cannot carry timeout-minutes and
+        # because the lint workflow needs the same thing.
+        "$GITHUB_WORKSPACE/ci/apt-get.sh" update -qq
+        # the list is deliberately split on whitespace
+        # shellcheck disable=SC2086
+        "$GITHUB_WORKSPACE/ci/apt-get.sh" install -y --no-install-recommends $packages
+
+    - name: Cache Test::Nginx
+      if: inputs.test-nginx == 'true'
+      uses: actions/cache@v6
+      with:
+        path: ~/perl5
+        key: cpan-${{ runner.os }}-test-nginx
+
+    - name: Install Test::Nginx
+      if: inputs.test-nginx == 'true'
+      shell: bash
+      run: |
+        # same reason as the apt step: a CPAN mirror that stalls must not
+        # hold the job until the ceiling
+        timeout 300 cpanm --local-lib=~/perl5 --notest --quiet Test::Nginx
+        echo "PERL5LIB=$HOME/perl5/lib/perl5" >> "$GITHUB_ENV"

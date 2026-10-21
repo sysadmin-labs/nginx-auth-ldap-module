@@ -1,0 +1,50 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  schedule:
+    # Monday morning, so a new nginx release that breaks the module shows
+    # up here and not in somebody's build
+    - cron: '7 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  analyse:
+    name: analyse the module sources
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup
+        with:
+          packages: libldap2-dev
+          test-nginx: 'false'
+
+      - name: Initialise CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: c-cpp
+          # the build pulls in all of nginx; only this module's own
+          # sources are ours to answer for
+          config: |
+            paths:
+              - src
+
+      - name: Build nginx with the module
+        run: |
+          . .github/versions.env
+          ci/build.sh "$NGINX_VERSION" "$HOME/nginx"
+
+      - name: Analyse
+        uses: github/codeql-action/analyze@v3

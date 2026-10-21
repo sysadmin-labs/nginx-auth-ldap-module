@@ -1,0 +1,37 @@
+# nginx allocates two things once and lets the process exit take them back,
+# so valgrind calls them lost.  Neither comes from this module: both traces
+# end in nginx's own code, and the module does not appear in either.
+#
+# These two are the only entries, and that is measured, not assumed.  With
+# an empty file the suite reports exactly these and nothing else -- no
+# invalid read, no uninitialised value, no conditional jump.  Anything that
+# was in here beyond them suppressed something that never happens.
+#
+# Note which cycle function they come through: Test::Nginx runs nginx with
+# master_process off, so everything here is the single-process path.  An
+# entry for the master's own path would never be reached from this suite
+# and so would be an entry nobody can check.
+#
+# If a later nginx brings a finding back, valgrind will say so with a full
+# trace.  Add it then, with a name and a reason, rather than keeping one
+# here on the chance that it is still needed.
+
+{
+   nginx keeps the environment array until the process ends
+   Memcheck:Leak
+   match-leak-kinds: definite
+   fun:malloc
+   fun:ngx_alloc
+   fun:ngx_set_environment
+   ...
+}
+
+{
+   nginx keeps the connection and event arrays until the process ends
+   Memcheck:Leak
+   match-leak-kinds: definite,indirect
+   fun:malloc
+   fun:ngx_alloc
+   fun:ngx_event_process_init
+   ...
+}

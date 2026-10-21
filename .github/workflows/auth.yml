@@ -1,0 +1,39 @@
+name: Auth
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  schedule:
+    # Monday morning, so a new nginx release that breaks the module shows
+    # up here and not in somebody's build
+    - cron: '59 7 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  auth:
+    name: who gets in and who does not
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # t/ reaches the configuration parser and nothing else: the module needs
+    # a directory to answer at all.  Here a slapd is started with two users
+    # and a group, and the answers to real requests are what is checked.
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup
+        with:
+          test-nginx: 'false'
+          packages: libldap2-dev slapd ldap-utils
+
+      - name: Build nginx
+        run: |
+          . .github/versions.env
+          ci/build.sh "$NGINX_VERSION" "$HOME/nginx"
+
+      - name: Members, non-members and the wrong password
+        run: ci/auth.sh "$HOME/nginx/sbin/nginx"

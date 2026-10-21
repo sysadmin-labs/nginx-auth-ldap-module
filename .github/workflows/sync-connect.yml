@@ -1,0 +1,44 @@
+name: Sync connect
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  schedule:
+    - cron: '59 8 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sync-connect:
+    name: a connect that comes back connected
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # ngx_event_connect_peer() answers NGX_OK when the connection is already
+    # established, and then registers no write event.  A module that waits
+    # for one waits for good.  The state is forced here with a small library
+    # in front of connect(2), because no kernel measured here produces it on
+    # a loopback connection.
+    #
+    # On this platform the check is a smoke test: nginx registers the write
+    # event through epoll's add_connection anyway, so the request would be
+    # served even without the handling in the module.  Where it bites is
+    # kqueue, and that is the FreeBSD job.
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup
+        with:
+          test-nginx: 'false'
+          packages: libldap2-dev slapd ldap-utils
+
+      - name: Build nginx
+        run: |
+          . .github/versions.env
+          ci/build.sh "$NGINX_VERSION" "$HOME/nginx"
+
+      - name: The whole matrix, with synchronous connects
+        run: ci/sync-connect.sh "$HOME/nginx/sbin/nginx"

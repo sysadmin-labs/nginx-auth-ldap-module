@@ -1,0 +1,70 @@
+name: A/UBSan
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  schedule:
+    # Monday morning, so a new nginx release that breaks the module shows
+    # up here and not in somebody's build
+    - cron: '7 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sanitizers:
+    name: address and undefined behaviour
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      # nginx runs the little programs its configure compiles.  With leak
+      # detection on, each of them reports at exit and returns non-zero,
+      # and every feature probe comes out "found but is not working".  So
+      # leaks are valgrind's job here, not this job's.
+      ASAN_OPTIONS: detect_leaks=0
+      # The suppression file names one finding in nginx's own startup
+      # path and says why; see ci/ubsan.suppress.  The path has to be
+      # absolute, the suite runs nginx from a directory of its own.
+      UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=0:suppressions=${{ github.workspace }}/ci/ubsan.suppress
+      CI_CC_OPT: '-fsanitize=address,undefined -fno-omit-frame-pointer -g -O1'
+      CI_LD_OPT: '-fsanitize=address,undefined'
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup
+        with:
+          packages: libldap2-dev slapd ldap-utils
+
+      - name: Build nginx with both sanitizers
+        run: |
+          . .github/versions.env
+          ci/build.sh "$NGINX_VERSION" "$HOME/nginx"
+
+      - name: Run the test suite under the sanitizers
+        run: |
+          set -o pipefail
+          ASAN_OPTIONS="$ASAN_OPTIONS:abort_on_error=0" \
+            TEST_NGINX_NO_SHUFFLE=1 \
+            TEST_NGINX_BINARY="$HOME/nginx/sbin/nginx" \
+            prove -r t/ 2>&1 | tee sanitizer.log
+
+      - name: Run the driver under the sanitizers
+        run: |
+          set -o pipefail
+          # t/ only reaches the configuration parser.  This is the part that
+          # walks the module at run time, which is what the sanitizers are
+          # here for.
+          ASAN_OPTIONS="$ASAN_OPTIONS:abort_on_error=0" \
+            ci/auth.sh "$HOME/nginx/sbin/nginx" 2>&1 | tee -a sanitizer.log
+
+      - name: No findings allowed
+        run: |
+          if grep -nE "AddressSanitizer|runtime error:" sanitizer.log; then
+            echo "a sanitizer reported the lines above" >&2
+            exit 1
+          fi
+          echo "the sanitizers found nothing"

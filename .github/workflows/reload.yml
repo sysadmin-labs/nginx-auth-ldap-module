@@ -1,0 +1,39 @@
+name: Reload
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  schedule:
+    # Monday morning, so a new nginx release that breaks the module shows
+    # up here and not in somebody's build
+    - cron: '53 7 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  reload:
+    name: eight reloads in a row
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Whatever a module allocates or opens per cycle and never releases
+    # grows the process on every reload and is invisible to a test suite,
+    # which starts nginx once.
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup
+        with:
+          packages: libldap2-dev slapd ldap-utils
+          test-nginx: 'false'
+
+      - name: Build nginx
+        run: |
+          . .github/versions.env
+          ci/build.sh "$NGINX_VERSION" "$HOME/nginx"
+
+      - name: Reload and look for what a reload leaks
+        run: ci/reload.sh "$HOME/nginx/sbin/nginx"

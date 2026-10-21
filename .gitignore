@@ -1,0 +1,14 @@
+# created by the test suite
+t/servroot/
+
+# created by ci/build.sh, ci/reload.sh and ci/expiry.sh
+ci-work/
+
+# leftovers from patch(1)
+*.orig
+*.rej
+
+# editor leftovers
+*~
+*.swp
+*.swo

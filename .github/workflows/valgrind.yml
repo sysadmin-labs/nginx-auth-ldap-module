@@ -1,0 +1,49 @@
+name: Valgrind
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  schedule:
+    # Monday morning, so a new nginx release that breaks the module shows
+    # up here and not in somebody's build
+    - cron: '7 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  valgrind:
+    name: run the suite under valgrind
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # slow, and a pull request is already covered by Build & Test
+    if: github.event_name != 'pull_request'
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup
+        with:
+          packages: libldap2-dev
+
+      - name: Build nginx
+        run: |
+          . .github/versions.env
+          ci/build.sh "$NGINX_VERSION" "$HOME/nginx"
+
+      - name: Run the test suite under valgrind
+        run: |
+          set -o pipefail
+          TEST_NGINX_USE_VALGRIND=1 TEST_NGINX_NO_SHUFFLE=1 \
+            TEST_NGINX_BINARY="$HOME/nginx/sbin/nginx" \
+            prove -r t/ 2>&1 | tee valgrind.log
+
+      - name: No findings allowed
+        run: |
+          if grep -niE "invalid read|invalid write|definitely lost|indirectly lost|uninitialised|uninitialized value|conditional jump|mismatched free" valgrind.log; then
+            echo "valgrind reported the lines above" >&2
+            exit 1
+          fi
+          echo "valgrind found nothing"

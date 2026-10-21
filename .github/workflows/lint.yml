@@ -1,0 +1,67 @@
+name: Lint
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  schedule:
+    # Monday morning, so a new nginx release that breaks the module shows
+    # up here and not in somebody's build
+    - cron: '7 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shell:
+    name: shell scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Make sure shellcheck is there
+        run: |
+          # The runner image ships shellcheck, so there is usually nothing
+          # to do.  If that changes, the install goes through the same
+          # bounded wrapper the build jobs use.
+          if ! command -v shellcheck > /dev/null 2>&1; then
+            ci/apt-get.sh update -qq
+            ci/apt-get.sh install -y --no-install-recommends shellcheck
+          fi
+          shellcheck --version | sed -n '2p'
+
+      - name: Check every script under ci/ and t/
+        run: |
+          # the nginx addon "config" files are fragments that nginx's own
+          # configure sources, not standalone scripts, so they stay out
+          files=$(find ci t -name '*.sh' 2>/dev/null | sort)
+          # reload.conf is shell too: reload.sh sources it
+          files="$files ci/reload.conf"
+          if [ -z "$files" ]; then
+            echo "no scripts to check"
+            exit 0
+          fi
+          echo "$files"
+          # shellcheck disable=SC2086
+          shellcheck --severity=warning --shell=sh $files
+
+  workflows:
+    name: workflow definitions
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Run actionlint
+        run: |
+          . .github/versions.env
+          url=https://github.com/rhysd/actionlint/releases/download
+          ci/fetch-verify.sh \
+            "$url/v$ACTIONLINT_VERSION/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" \
+            "$ACTIONLINT_SHA256" actionlint.tar.gz
+          tar xzf actionlint.tar.gz actionlint
+          ./actionlint -color

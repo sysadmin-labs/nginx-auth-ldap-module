@@ -1,0 +1,57 @@
+name: FreeBSD
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  schedule:
+    # Monday morning, so a new nginx release that breaks the module shows
+    # up here and not in somebody's build
+    - cron: '7 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  freebsd:
+    name: build and test in a virtual machine
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    # every other workflow measures Linux, and the port this module is
+    # packaged in is a FreeBSD one
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build and run the suite in a FreeBSD virtual machine
+        uses: vmactions/freebsd-vm@v1.5.9
+        with:
+          release: '14'
+          prepare: |
+            # the client library is what the module links against, the
+            # server is what the drivers talk to, and curl is not in the
+            # base system
+            pkg install -y git pcre2 curl p5-Test-Nginx \
+              openldap26-server openldap26-client
+          run: |
+            . .github/versions.env
+            ci/build.sh "$NGINX_VERSION" "$HOME/nginx"
+            # the job runs as root, and Test::Nginx then writes "user
+            # root;" into its configuration.  root has no group of that
+            # name here, it is in wheel
+            TEST_NGINX_WORKER_USER='root wheel' \
+              TEST_NGINX_NO_SHUFFLE=1 \
+            TEST_NGINX_BINARY="$HOME/nginx/sbin/nginx" prove -r t/
+            ci/auth.sh "$HOME/nginx/sbin/nginx"
+            # This is the job the check belongs to: nginx uses kqueue here,
+            # and kqueue has no add_connection, so a connect that comes back
+            # connected leaves the write event unregistered.  On epoll the
+            # same case is harmless, which is why the Linux job cannot show
+            # it.
+            ci/sync-connect.sh "$HOME/nginx/sbin/nginx"
+            # www/nginx ships this module as a loadable object, so that is
+            # the build the package is made of and it is built here too
+            ci/build.sh "$NGINX_VERSION" "$HOME/nginx-dyn" dynamic
+            AUTH_LOAD_MODULE=$HOME/nginx-dyn/modules/ngx_http_auth_ldap_module.so \
+              ci/auth.sh "$HOME/nginx-dyn/sbin/nginx"
