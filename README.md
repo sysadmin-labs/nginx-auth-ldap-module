@@ -35,11 +35,9 @@
 HTTP basic authentication against an LDAP directory: `auth_ldap` with server
 blocks, group requirements, a connection pool and an answer cache.
 
-A maintained fork of `kvspb/nginx-auth-ldap`.  Upstream last touched the
-module's code in December 2023, and that change was a typo in a comment; the
-one tag it carries is from 2011, and the pull request for the bug fixed here
-has been open since October 2026.  The fixes this fork carries are in the
-[changelog](CHANGELOG.md).
+A maintained fork of `kvspb/nginx-auth-ldap`, whose code upstream last
+changed in December 2023.  What this fork fixes, and what it does not, is in
+the [changelog](CHANGELOG.md).
 
 ## Synopsis
 
@@ -86,9 +84,10 @@ Inside the block:
 |---|---|
 | `url` | `ldap://` or `ldaps://` followed by host, port, base DN, the attribute a login name is matched against, the scope and a filter.  The attribute is required. |
 | `binddn`, `binddn_passwd` | the account the search is made with.  Without them the search is anonymous. |
-| `group_attribute` | the attribute a group lists its members in, `member` or `uniqueMember` as a rule |
-| `group_attribute_is_dn` | `on` when that attribute holds distinguished names, `off`, the default, when it holds login names |
+| `group_attribute` | the attribute a group lists its members in, `member` or `uniqueMember` as a rule.  There is no default: a `require group` rule without it refuses every request. |
+| `group_attribute_is_dn` | `on` when that attribute holds distinguished names.  Only `on` is read; left out, the attribute is taken to hold login names. |
 | `require valid_user` | any account that binds is let in |
+| `require valid_user "<dn>"` | the login name goes into that template, and the result is the DN that is bound, instead of the DN the search found |
 | `require user "<dn>"` | that one account |
 | `require group "<dn>"` | membership in that group |
 | `satisfy` | `all` means every `require` has to hold, `any` means one of them is enough, which is the default |
@@ -97,10 +96,8 @@ Inside the block:
 | `reconnect_timeout` | how long a connection that was lost waits before it is made again, 10s |
 | `max_down_retries` | how often a connection that the directory dropped is rebuilt right away instead of waiting out `reconnect_timeout`, 0 by default |
 | `referral` | `on` by default; `off` makes a referral an error instead of a redirection |
-| `ssl_check_cert`, `ssl_ca_file`, `ssl_ca_dir` | for `ldaps://`: whether the certificate of the directory is verified, `off` by default, and against which authorities.  A certificate is accepted when its chain verifies and it names the host the url names, or the address the connection was made to. |
+| `ssl_check_cert`, `ssl_ca_file`, `ssl_ca_dir` | for `ldaps://`: whether the certificate of the directory is verified, `off` by default and only `on` is read, and which authorities are trusted.  Named authorities take the place of the trust store of the system rather than adding to it.  A certificate is accepted when its chain verifies and it names the host the url names, or the address the connection was made to; the name may come from the common name where there is no subject alternative name, as in nginx's own check, a partial wildcard is refused, and revocation is not checked. |
 | `include` | reads a file into the block, for the password that does not belong in the main configuration |
-
-A value with a space has to be quoted as a whole, the way nginx quotes.
 
 ### `auth_ldap`
 
@@ -137,11 +134,12 @@ The cache holds the hash of the credentials, not the credentials.
 
 ### `auth_ldap_cache_size`
 
-**syntax:** `auth_ldap_cache_size <number>`
+**syntax:** `auth_ldap_cache_size <size>`
 **default:** `100`
 **context:** `http`
 
-Fewer than 100 is refused when the configuration is read, as is an
+How many outcomes the cache holds.  The value is a size, so `1k` means 1024
+of them.  Fewer than 100 is refused when the configuration is read, as is an
 expiration below one second.
 
 ### `auth_ldap_servers_size`
@@ -150,17 +148,31 @@ expiration below one second.
 **default:** `7`
 **context:** `http`
 
-How many `ldap_server` blocks the configuration is expected to hold.  More
-of them still work; the number only sizes an array.
+The number sizes the array the blocks go into.  More of them work as long as
+every `ldap_server` block stands before the first `auth_ldap_servers`: the
+array moves when it grows, and a location holds pointers into it.
 
 ## Behaviour
 
 A `require` rule may hold a variable, as in
-`require group "cn=$http_x_group,ou=groups,dc=example,dc=com"`.  The value of
-the variable is then a name and nothing else: it is escaped before it goes
-into a filter, and a bind DN that a variable gives another relative name to
-is refused.  Such a server is also answered without the cache, whose key
-cannot see the rule.
+`require group "cn=$http_x_group,ou=groups,dc=example,dc=com"`.  The value is
+then a name and nothing else: it is escaped before it goes into a filter, and
+the whole rule has to be a distinguished name or the request is refused.
+Where the variable stands inside the name, as above, a comma it brings would
+add a relative name nobody wrote, and that is refused too.  Where the
+variable ends the rule, as in
+`require group "cn=staff,$http_x_base"`, the tail of the name is the
+variable's to give, so the request chooses the base the group is searched
+under -- which is what putting a variable there says.
+
+A server with such a rule is answered without the cache, whose key is the
+user, the password and the bytes of the server and cannot see a rule that is
+decided per request.
+
+A request the module cannot decide is answered 500: no directory answered,
+or none could be reached.  A directory whose certificate is refused has no
+usable connection at all, so a request through it waits out its
+`request_timeout` before it gets that answer.
 
 The handler runs in the access phase, so a refused request never reaches the
 content phase.  Every worker keeps its own connections, made when it starts
@@ -168,13 +180,13 @@ and closed when it leaves, and a request that finds them all busy waits for
 one to come free rather than opening another.
 
 With `connections` left at its default of one, every request through a block
-waits behind the request before it.  For anything that serves more than a
-few logins at a time that is worth raising.
+waits behind the request before it.
 
 ## Building
 
 ```sh
-./configure --add-module=/path/to/nginx-auth-ldap-module
+./configure --with-http_ssl_module \
+    --add-module=/path/to/nginx-auth-ldap-module
 ```
 
 or as a loadable module
@@ -185,14 +197,14 @@ or as a loadable module
 ```
 
 with `load_module modules/ngx_http_auth_ldap_module.so;` in the main
-context.  `--with-compat` is what lets the object load into a binary that
-somebody else built.
+context.
 
-Two things are required.  The OpenLDAP client library, which is looked for
-at configure time; where its headers are not in the default search path,
-point to them with `--with-cc-opt` and `--with-ld-opt`.  And
-`--with-http_ssl_module`, because the `ldaps://` support of the module is
-compiled only when nginx has OpenSSL.
+The OpenLDAP client library is required and is looked for at configure time;
+where its headers are not in the default search path, point to them with
+`--with-cc-opt` and `--with-ld-opt`.  `--with-http_ssl_module` is what
+`ldaps://` needs: that part of the module is compiled only when nginx has
+OpenSSL, and without it a `url ldaps://...` is refused when the
+configuration is read.
 
 ## Testing
 
@@ -200,12 +212,13 @@ compiled only when nginx has OpenSSL.
 ci/build.sh 1.30.5 /tmp/nginx-test
 TEST_NGINX_BINARY=/tmp/nginx-test/sbin/nginx prove -r t/
 ci/auth.sh /tmp/nginx-test/sbin/nginx
+ci/ldaps.sh /tmp/nginx-test/sbin/nginx
 ci/sync-connect.sh /tmp/nginx-test/sbin/nginx
 ci/reload.sh /tmp/nginx-test/sbin/nginx
 ```
 
 `t/` covers the configuration parser.  The drivers need a directory and
-start one themselves: `ci/ldap.sh` runs a slapd with two users and a group,
+start one themselves: `ci/ldap.sh` runs a slapd with four users and two groups,
 `ci/auth.sh` asks who gets in, `ci/ldaps.sh` does the same over TLS and
 checks what a refused certificate does, `ci/sync-connect.sh` repeats the
 matrix with a `connect(2)` that comes back already connected, and
@@ -214,11 +227,14 @@ matrix with a `connect(2)` that comes back already connected, and
 ## Credits and license
 
 The module is the work of Valery Komarov, Jiri Hruska and Victor Hahn
-Castell, BSD 2-Clause, see [LICENSE](LICENSE).  This fork keeps that licence
-and adds the fixes listed in the changelog.
+Castell, BSD 2-Clause, see [LICENSE](LICENSE).  This fork keeps that licence.
 
-Three of those fixes were proposed upstream before they were made here, and
-the proposals are the work of their authors: the escaping of filter values
+Several of the fixes were proposed upstream before they were made here, and
+those proposals are the work of their authors: the escaping of filter values
 by onovy (pull request 239), the handling of a connect that has already
-completed by NuLL3rr0r (617), and the terminated header list together with
-the freeing of the parsed url by freultwah (250).
+completed by NuLL3rr0r (617), the terminated header list together with the
+freeing of the parsed url by freultwah (250) and the header list again by
+jessp01 (252, 253), the address the certificate of the directory is held
+against by mmguero (237) and Ericbla (251), and the lookup of the cache for
+every server of a location, whose consequences are fixed here, by landryb
+(219).
