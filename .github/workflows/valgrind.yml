@@ -47,7 +47,7 @@ jobs:
         run: |
           # t/ reaches the configuration parser; this walks a request
           # through the module, which is where a leak per request would be.
-          AUTH_WRAP="valgrind --leak-check=full --show-leak-kinds=definite,indirect,possible --num-callers=30 --error-exitcode=0 --suppressions=$PWD/valgrind.suppress --log-file=$PWD/vg-auth.log" \
+          AUTH_WRAP="valgrind --leak-check=full --show-leak-kinds=definite,indirect,possible --errors-for-leak-kinds=definite,indirect --num-callers=30 --error-exitcode=0 --suppressions=$PWD/valgrind.suppress --log-file=$PWD/vg-auth.log" \
             ci/auth.sh "$HOME/nginx/sbin/nginx"
           # valgrind writes a summary whether or not it found anything, so
           # its absence means valgrind did not run and the gate is blind
@@ -62,6 +62,12 @@ jobs:
           }
           # And the summary is the verdict: counting on a list of phrases
           # lets through every kind of finding that is not on the list.
+          #
+          # A block that is only possibly lost still shows in the log, but
+          # it does not count: whether an interior pointer survives to the
+          # exit is not a property of this code.  Measured, not assumed --
+          # two runs of the same commit came back with 27,136 bytes in three
+          # blocks and with none.
           grep -q "ERROR SUMMARY: 0 errors" vg-auth.log || {
             echo "valgrind counted findings of its own, see the log above" >&2
             exit 1
