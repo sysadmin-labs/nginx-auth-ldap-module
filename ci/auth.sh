@@ -121,6 +121,19 @@ http {
         connections 2;
     }
 
+    # A group whose own name carries a comma, which a backslash makes part
+    # of the value rather than a separator.
+    ldap_server comma {
+        url ldap://127.0.0.1:$LDAP_PORT/ou=people,dc=test,dc=local?uid?sub?(objectClass=inetOrgPerson);
+        binddn "cn=admin,dc=test,dc=local";
+        binddn_passwd secret;
+        group_attribute description;
+        satisfy all;
+        require valid_user;
+        require group "cn=Admins\\,Global,ou=groups,dc=test,dc=local";
+        connections 2;
+    }
+
     ldap_server varbase {
         url ldap://127.0.0.1:$LDAP_PORT/ou=people,dc=test,dc=local?uid?sub?(objectClass=inetOrgPerson);
         binddn "cn=admin,dc=test,dc=local";
@@ -168,6 +181,12 @@ http {
         location = /byloginname.txt {
             auth_ldap "Members by login name";
             auth_ldap_servers byloginname;
+            alias $WORK/html/staff.txt;
+        }
+
+        location = /comma.txt {
+            auth_ldap "A group with a comma in its name";
+            auth_ldap_servers comma;
             alias $WORK/html/staff.txt;
         }
 
@@ -228,8 +247,13 @@ until curl -s -o /dev/null --max-time 2 "http://127.0.0.1:$PORT/open.txt"; do
 	sleep 1
 done
 
+# Under a wrapper every request carries valgrind's or the sanitizers' cost,
+# and a leash cut for a plain run is what makes such a driver flap.
+TMO=${AUTH_TMO:-5}
+[ -n "${AUTH_WRAP:-}" ] && TMO=${AUTH_TMO:-30}
+
 code() {
-	curl -s -o "$WORK/body" -w '%{http_code}' --max-time 5 "$@" || echo 000
+	curl -s -o "$WORK/body" -w '%{http_code}' --max-time "$TMO" "$@" || echo 000
 }
 
 echo "== no credentials: 401 and one well formed challenge"
@@ -345,8 +369,17 @@ echo "== a bind DN built from the login name keeps its shape"
 out=$(code -u 'alice,ou=people,dc=test,dc=local,x=y:alicepw' "http://127.0.0.1:$PORT/vardn.txt")
 echo "  a name with commas in it: $out"
 [ "$out" = 401 ] || note "a login name that adds relative names was accepted, got $out"
-grep -q "is not shaped like its configuration" "$WORK/logs/error.log" ||
+grep -q 'the bind DN .* is not shaped like its configuration' "$WORK/logs/error.log" ||
 	note "the error log does not say that the bind DN was refused"
+
+echo "== a comma a backslash holds is part of the name, not a separator"
+# The group is cn=Admins\,Global.  Split at the first comma the string
+# carries, the filter asserts on "cn=Admins\" and the search runs under
+# "Global,ou=groups,dc=test,dc=local", which is nowhere.
+out=$(code -u alice:alicepw "http://127.0.0.1:$PORT/comma.txt")
+echo "  the member of that group: $out"
+[ "$out" = 200 ] ||
+	note "a group whose name carries a comma was split in the middle, got $out"
 
 echo "== the base a group is searched under keeps its shape"
 out=$(code -u alice:alicepw -H 'X-Base: ou=groups,dc=test,dc=local' \

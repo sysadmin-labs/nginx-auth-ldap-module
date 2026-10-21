@@ -180,6 +180,11 @@ sn: Carol
 mail: carol@test.local
 userPassword: carolpw
 
+dn: cn=Admins\,Global,ou=groups,dc=test,dc=local
+objectClass: organizationalRole
+cn: Admins,Global
+description: alice
+
 dn: cn=byname,ou=groups,dc=test,dc=local
 objectClass: organizationalRole
 cn: byname

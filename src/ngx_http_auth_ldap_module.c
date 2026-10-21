@@ -108,7 +108,6 @@ typedef struct {
 
     ngx_uint_t connections;
     ngx_uint_t max_down_retries;
-    ngx_uint_t max_down_retries_count;
     ngx_msec_t connect_timeout;
     ngx_msec_t reconnect_timeout;
     ngx_msec_t bind_timeout;
@@ -126,12 +125,25 @@ typedef struct {
     ngx_flag_t cacheable;
 
     /*
-     * Whether the trust store of the shared SSL context already holds the
-     * authorities of this server.  Behind free_connections for the same
-     * reason as conns: it changes while the worker runs, and in front of
-     * that field it would change the hash of a server that has not changed.
+     * How often a connection of this server that the directory dropped has
+     * been rebuilt right away.  Behind free_connections for the same reason
+     * as conns: it changes while the worker runs, and in front of that field
+     * a directory that drops a connection would change the hash of a server
+     * whose configuration has not changed.
      */
-    ngx_flag_t ssl_ca_loaded;
+    ngx_uint_t max_down_retries_count;
+
+#if (NGX_OPENSSL)
+    /*
+     * The authorities this server is held against, in a store of its own.
+     * The SSL context belongs to the configuration and is shared by every
+     * server in it, so authorities loaded into its store would be trusted by
+     * all the others as well -- and a server that names none would put the
+     * store of the system back behind the ones that were named.  The store
+     * is built in init_main_conf and attached to each connection.
+     */
+    X509_STORE *ssl_store;
+#endif
 
     /*
      * How many commas the template of require_valid_user_dn carries, or -1
@@ -709,8 +721,23 @@ ngx_http_auth_ldap_parse_url(ngx_conf_t *cf, ngx_http_auth_ldap_server_t *server
         return NGX_CONF_ERROR;
     }
 
+    /*
+     * RFC 4516 lets a url leave the host out, and ldap_url_parse() then
+     * hands back a null pointer for it.  Everything below reads it as a
+     * string, so the master process went down while it read its
+     * configuration.
+     */
+    if (server->ludpp->lud_host == NULL) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "http_auth_ldap: auth_ldap_url names no host.");
+        return NGX_CONF_ERROR;
+    }
+
     server->url.data = ngx_palloc(cf->pool, ngx_strlen(server->ludpp->lud_scheme) + sizeof("://") - 1 +
         ngx_strlen(server->ludpp->lud_host) + sizeof(":65535"));
+    if (server->url.data == NULL) {
+        return NGX_CONF_ERROR;
+    }
     p = ngx_sprintf(server->url.data, "%s://%s:%d%Z", server->ludpp->lud_scheme, server->ludpp->lud_host,
         server->ludpp->lud_port);
     server->url.len = p - server->url.data - 1;
@@ -947,10 +974,77 @@ ngx_http_auth_ldap_create_main_conf(ngx_conf_t *cf)
     return conf;
 }
 
+#if (NGX_OPENSSL)
+static void
+ngx_http_auth_ldap_free_store(void *data)
+{
+    X509_STORE_free(data);
+}
+#endif
+
 static char *
 ngx_http_auth_ldap_init_main_conf(ngx_conf_t *cf, void *parent)
 {
     ngx_http_auth_ldap_main_conf_t *conf = parent;
+
+#if (NGX_OPENSSL)
+    /*
+     * Every server that verifies a certificate gets a trust store of its
+     * own, loaded here, where all the blocks have been read: the SSL context
+     * is one for the whole configuration, so a store loaded into it would be
+     * the store of every server at once.  A named authority that cannot be
+     * loaded fails the configuration rather than leaving a server that
+     * trusts whatever happens to be in the store of the system.
+     */
+    if (conf->servers != NULL) {
+        ngx_uint_t i;
+
+        for (i = 0; i < conf->servers->nelts; i++) {
+            ngx_http_auth_ldap_server_t *server =
+                &((ngx_http_auth_ldap_server_t *) conf->servers->elts)[i];
+            ngx_pool_cleanup_t *cln;
+            X509_STORE *store;
+            int rc;
+
+            if (!server->ssl_check_cert) {
+                continue;
+            }
+
+            store = X509_STORE_new();
+            if (store == NULL) {
+                return NGX_CONF_ERROR;
+            }
+
+            cln = ngx_pool_cleanup_add(cf->pool, 0);
+            if (cln == NULL) {
+                X509_STORE_free(store);
+                return NGX_CONF_ERROR;
+            }
+            cln->handler = ngx_http_auth_ldap_free_store;
+            cln->data = store;
+
+            if (server->ssl_ca_file.data || server->ssl_ca_dir.data) {
+                rc = X509_STORE_load_locations(store,
+                    (char *) server->ssl_ca_file.data,
+                    (char *) server->ssl_ca_dir.data);
+            } else {
+                rc = X509_STORE_set_default_paths(store);
+            }
+
+            if (rc != 1) {
+                unsigned long error_code = ERR_get_error();
+
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                    "http_auth_ldap: the certificate authorities of \"%V\" "
+                    "could not be loaded: %s", &server->alias,
+                    ERR_error_string(error_code, NULL));
+                return NGX_CONF_ERROR;
+            }
+
+            server->ssl_store = store;
+        }
+    }
+#endif
 
     if (conf->cache_enabled == NGX_CONF_UNSET) {
         conf->cache_enabled = 0;
@@ -1354,6 +1448,14 @@ ngx_http_auth_ldap_close_connection(ngx_http_auth_ldap_connection_t *c)
         q = ngx_queue_next(q);
     }
 
+    /*
+     * The request that held this connection keeps a pointer to it, and
+     * would hand a connection that is gone back to the pool.
+     */
+    if (c->rctx != NULL) {
+        c->rctx->c = NULL;
+    }
+
     c->rctx = NULL;
     if (c->state != STATE_DISCONNECTED) {
         c->state = STATE_DISCONNECTED;
@@ -1417,6 +1519,7 @@ static void
 ngx_http_auth_ldap_return_connection(ngx_http_auth_ldap_connection_t *c)
 {
     ngx_queue_t *q;
+    ngx_flag_t free;
 
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0, "http_auth_ldap: Marking the connection to \"%V\" as free",
         &c->server->alias);
@@ -1431,8 +1534,13 @@ ngx_http_auth_ldap_return_connection(ngx_http_auth_ldap_connection_t *c)
     /*
      * The same scan the other direction makes: inserting a connection that
      * is already in the queue links it to itself, and every later walk over
-     * the queue then runs until it is stopped from outside.
+     * the queue then runs until it is stopped from outside.  A connection
+     * that is no longer usable does not go in at all -- the next request
+     * would take it out and bind on a handle that is gone.  Either way the
+     * waiting requests are still woken: this may be the last call that can.
      */
+    free = c->state == STATE_READY && c->ld != NULL;
+
     for (q = ngx_queue_head(&c->server->free_connections);
          q != ngx_queue_sentinel(&c->server->free_connections);
          q = ngx_queue_next(q))
@@ -1441,11 +1549,15 @@ ngx_http_auth_ldap_return_connection(ngx_http_auth_ldap_connection_t *c)
             ngx_log_debug1(NGX_LOG_DEBUG_HTTP, c->log, 0,
                 "http_auth_ldap: the connection to \"%V\" is already free",
                 &c->server->alias);
-            return;
+            free = 0;
+            break;
         }
     }
 
-    ngx_queue_insert_head(&c->server->free_connections, &c->queue);
+    if (free) {
+        ngx_queue_insert_head(&c->server->free_connections, &c->queue);
+    }
+
     if (!ngx_queue_empty(&c->server->waiting_requests)) {
         q = ngx_queue_last(&c->server->waiting_requests);
         ngx_queue_remove(q);
@@ -1719,53 +1831,21 @@ ngx_http_auth_ldap_ssl_handshake(ngx_http_auth_ldap_connection_t *c)
     if (c->server->ssl_check_cert) {
 
       /*
-       * The authorities go into the trust store of a context that is shared
-       * by every connection to this server, so they are loaded once and not
-       * again on each reconnect.  Named authorities take the place of the
-       * ones of the system: a configuration that says which authority signs
-       * its directory means that one, and adding the system store behind it
-       * would make the statement say nothing.
+       * This server's own store, hung on this connection: the SSL context is
+       * shared by the whole configuration, so anything put into its store
+       * would be trusted by every other server in it as well.
        */
-      if (!c->server->ssl_ca_loaded) {
-        int setcode;
-        unsigned long error_code;
-
-        if (c->server->ssl_ca_file.data || c->server->ssl_ca_dir.data) {
-#if (OPENSSL_VERSION_NUMBER >= 0x10100000L)
-          setcode = SSL_CTX_load_verify_locations(transport->ssl->session_ctx,
-            (char*)(c->server->ssl_ca_file.data), (char*)(c->server->ssl_ca_dir.data));
-#else
-          setcode = SSL_CTX_load_verify_locations(transport->ssl->connection->ctx,
-            (char*)(c->server->ssl_ca_file.data), (char*)(c->server->ssl_ca_dir.data));
-#endif
-          if (setcode != 1) {
-            error_code = ERR_get_error();
-            ngx_log_error(NGX_LOG_ERR, c->log, 0,
-              "http_auth_ldap: the named certificate authorities could not be "
-              "loaded, so nothing is trusted yet: error %lu, %s",
-              error_code, ERR_error_string(error_code, NULL));
-          }
-        } else {
-#if (OPENSSL_VERSION_NUMBER >= 0x10100000L)
-          setcode = SSL_CTX_set_default_verify_paths(transport->ssl->session_ctx);
-#else
-          setcode = SSL_CTX_set_default_verify_paths(transport->ssl->connection->ctx);
-#endif
-          if (setcode != 1) {
-            error_code = ERR_get_error();
-            ngx_log_error(NGX_LOG_ERR, c->log, 0,
-              "http_auth_ldap: the certificate authorities of the system could "
-              "not be loaded, so nothing is trusted yet: error %lu, %s",
-              error_code, ERR_error_string(error_code, NULL));
-          }
-        }
-
-        /* a store that was filled need not be filled again; one that was
-           not is tried again on the next connection */
-        if (setcode == 1) {
-          c->server->ssl_ca_loaded = 1;
-        }
+#if OPENSSL_VERSION_NUMBER >= 0x10002000
+      if (SSL_set1_verify_cert_store(transport->ssl->connection,
+                                     c->server->ssl_store) != 1)
+      {
+        ngx_log_error(NGX_LOG_ERR, c->log, 0,
+          "http_auth_ldap: the trust store of the server could not be put on "
+          "the connection");
+        ngx_http_auth_ldap_close_connection(c);
+        return;
       }
+#endif
 
       // use validating version of next function
       callback = &ngx_http_auth_ldap_ssl_handshake_validating_handler;
@@ -1868,10 +1948,15 @@ ngx_http_auth_ldap_read_handler(ngx_event_t *rev)
                 c->server->max_down_retries_count++;
                 ngx_log_error(NGX_LOG_ERR, c->log, 0, "http_auth_ldap: LDAP_SERVER_DOWN: retry count: %d",
                     c->server->max_down_retries_count);
+                /*
+                 * rev belongs to the nginx connection that closing has just
+                 * given back, so the handler cannot be called with it: it
+                 * reads the LDAP connection out of the event and would find
+                 * whatever the free list left there.  The reconnect is
+                 * already armed, and this brings it forward.
+                 */
                 c->state = STATE_DISCONNECTED;
-                // immediate reconnect synchronously, this schedules another
-                // timer call to this read handler again
-                ngx_http_auth_ldap_reconnect_handler(rev);
+                ngx_add_timer(&c->reconnect_event, 1);
                 return;
             } 
 
@@ -2122,7 +2207,7 @@ ngx_http_auth_ldap_init_connections(ngx_cycle_t *cycle)
 /*** Per-request authentication processing ***/
 
 /**
- * Respond with "403 Forbidden" and add correct headers
+ * Respond with "401 Unauthorized" and the WWW-Authenticate header
  */
 static ngx_int_t
 ngx_http_auth_ldap_set_realm(ngx_http_request_t *r, ngx_str_t *realm)
@@ -2268,7 +2353,9 @@ ngx_http_auth_ldap_authenticate(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t 
                  */
                 ctx->cache_key.bucket = NULL;
                 if (ngx_http_auth_ldap_cache.buckets != NULL) {
-                    for (i = 0; i < conf->servers->nelts; i++) {
+                    /* from the server that is about to decide: one this
+                       request has already been refused by has had its say */
+                    for (i = ctx->server_index; i < conf->servers->nelts; i++) {
                         s = ((ngx_http_auth_ldap_server_t **) conf->servers->elts)[i];
                         rc = ngx_http_auth_ldap_check_cache(r, &ngx_http_auth_ldap_cache, s,
                             s == ctx->server ? &ctx->cache_key : &foreign_key);
@@ -2406,6 +2493,12 @@ ngx_http_auth_ldap_authenticate(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t 
                     /* LDAP operation in progress, wait for the result */
                     return NGX_AGAIN;
                 }
+                if (rc == NGX_ERROR) {
+                    /* the bind did not happen, so there is nothing to undo
+                       and nothing this server has decided */
+                    ctx->phase = PHASE_NEXT;
+                    break;
+                }
 
                 /* All steps done, finish the processing */
                 ctx->phase = PHASE_REBIND;
@@ -2528,6 +2621,12 @@ ngx_http_auth_ldap_search(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *ctx)
     return NGX_OK;
 }
 
+/*
+ * The commas that separate relative names.  One with a backslash in front
+ * of it is part of a value, which is why the count and the split below have
+ * to read a name the same way: a count that took it for a separator would
+ * accept a name the split then cuts in the middle of a value.
+ */
 static ngx_uint_t
 ngx_http_auth_ldap_count_commas(ngx_str_t *s)
 {
@@ -2535,6 +2634,10 @@ ngx_http_auth_ldap_count_commas(ngx_str_t *s)
     ngx_uint_t  commas = 0;
 
     for (q = s->data; q < s->data + s->len; q++) {
+        if (*q == '\\') {
+            q++;
+            continue;
+        }
         if (*q == ',') {
             commas++;
         }
@@ -2542,6 +2645,8 @@ ngx_http_auth_ldap_count_commas(ngx_str_t *s)
 
     return commas;
 }
+
+
 
 /*
  * Whether the last thing in a template is a variable.  Where it is, the
@@ -2564,9 +2669,27 @@ ngx_http_auth_ldap_ends_in_variable(ngx_str_t *s)
         return 0;
     }
 
+    /*
+     * One variable only.  With two of them the rule would take the looser
+     * rule of the one at the end for the one in the middle, and a comma
+     * from the middle one adds a relative name.
+     */
+    for (q = s->data; q < s->data + s->len; q++) {
+        if (*q == '$' && q != dollar) {
+            return 0;
+        }
+    }
+
     q = dollar + 1;
 
     if (*q == '{') {
+        /* and the brace has to be the one that closes at the end */
+        for (q++; q < s->data + s->len - 1; q++) {
+            if (*q == '}') {
+                return 0;
+            }
+        }
+
         return s->data[s->len - 1] == '}';
     }
 
@@ -2632,18 +2755,25 @@ ngx_http_auth_ldap_check_attribute(u_char *name)
 }
 
 /*
- * Whether a group DN still has the shape its configuration had, and is a
- * distinguished name at all.  Everything behind the first relative name is
- * the base the group is searched under, so a variable that brings a comma
- * of its own picks that base, and one that brings none can still put
- * whatever it likes in front of ldap_search_ext().  NGX_DECLINED is a value
- * that was refused, not an error of ours.
+ * Read a group rule as the distinguished name it is: the attribute and value
+ * of its first relative name, which become the assertion, and the rest,
+ * which becomes the base the search runs under.  libldap unescapes the
+ * value on the way, so a comma a backslash holds is a comma in the value and
+ * not a separator -- cutting the string at the first comma instead asserted
+ * on "cn=Admins\" and searched under "Global,...".
+ *
+ * The caller frees *dn with ldap_dnfree() and *base with ldap_memfree().
+ * NGX_DECLINED is a value that was refused, not an error of ours.
  */
 static ngx_int_t
-ngx_http_auth_ldap_check_group_shape(ngx_http_request_t *r,
-    ngx_http_auth_ldap_group_rule_t *rule, ngx_str_t *val)
+ngx_http_auth_ldap_read_group(ngx_http_request_t *r,
+    ngx_http_auth_ldap_group_rule_t *rule, ngx_str_t *val, LDAPDN *dn,
+    char **base)
 {
-    LDAPDN dn;
+    LDAPAVA *ava;
+
+    *dn = NULL;
+    *base = NULL;
 
     if (ngx_http_auth_ldap_has_null(val)) {
         ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
@@ -2665,7 +2795,7 @@ ngx_http_auth_ldap_check_group_shape(ngx_http_request_t *r,
         }
     }
 
-    if (ldap_str2dn((const char *) val->data, &dn, LDAP_DN_FORMAT_LDAPV3)
+    if (ldap_str2dn((const char *) val->data, dn, LDAP_DN_FORMAT_LDAPV3)
         != LDAP_SUCCESS)
     {
         ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
@@ -2674,7 +2804,39 @@ ngx_http_auth_ldap_check_group_shape(ngx_http_request_t *r,
         return NGX_DECLINED;
     }
 
-    ldap_dnfree(dn);
+    /* a relative name to assert on, and something left to search under */
+    if (*dn == NULL || (*dn)[0] == NULL || (*dn)[1] == NULL) {
+        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+            "http_auth_ldap: the group \"%V\" has no base to search under, "
+            "so it is refused", val);
+        return NGX_DECLINED;
+    }
+
+    /* one value, because the filter can only assert on one */
+    if ((*dn)[0][1] != NULL) {
+        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+            "http_auth_ldap: the first relative name of \"%V\" holds more "
+            "than one value, so it is refused", val);
+        return NGX_DECLINED;
+    }
+
+    ava = (*dn)[0][0];
+
+    if (ngx_http_auth_ldap_check_attribute((u_char *) ava->la_attr.bv_val)
+        != NGX_OK)
+    {
+        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+            "http_auth_ldap: \"%s\" is not the name of an attribute, so the "
+            "group is refused", ava->la_attr.bv_val);
+        return NGX_DECLINED;
+    }
+
+    if (ldap_dn2str(&(*dn)[1], base, LDAP_DN_FORMAT_LDAPV3) != LDAP_SUCCESS) {
+        ngx_log_error(NGX_LOG_WARN, r->connection->log, 0,
+            "http_auth_ldap: the base of \"%V\" could not be written out",
+            val);
+        return NGX_ERROR;
+    }
 
     return NGX_OK;
 }
@@ -2777,7 +2939,6 @@ ngx_http_auth_ldap_check_group(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *
     ngx_http_auth_ldap_group_rule_t *rules, *rule;
     ngx_int_t rc;
     u_char *filter;
-    u_char *eq;
     ngx_str_t user_val, gr_val, gr_esc, group_dn;
     char *attrs[2];
     size_t for_filter;
@@ -2833,39 +2994,42 @@ ngx_http_auth_ldap_check_group(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *
     }
 
     char *gr;
-    char *cn_gr;
-    char *tail_gr;
-    gr = ngx_pcalloc(r->pool,val.len+1);
+    char *base = NULL;
+    LDAPDN dn = NULL;
+    LDAPAVA *ava;
+
+    gr = ngx_pcalloc(r->pool, val.len + 1);
+    if (gr == NULL) {
+        ctx->outcome = OUTCOME_ERROR;
+        ngx_http_auth_ldap_return_connection(ctx->c);
+        return NGX_ERROR;
+    }
     ngx_memcpy(gr, val.data, val.len);
     gr[val.len] = '\0';
 
-    /* the copy is what is checked and what is used: it is the one that ends
-       in a null byte, which is what libldap reads it as */
+    /* the copy is what is read: it is the one that ends in a null byte,
+       which is how libldap takes it */
     group_dn.data = (u_char *) gr;
     group_dn.len = val.len;
 
-    if (ngx_http_auth_ldap_check_group_shape(r, rule, &group_dn) != NGX_OK) {
+    rc = ngx_http_auth_ldap_read_group(r, rule, &group_dn, &dn, &base);
+    if (rc != NGX_OK) {
+        ldap_memfree(base);
+        ldap_dnfree(dn);
         ctx->outcome = OUTCOME_ERROR;
         ngx_http_auth_ldap_return_connection(ctx->c);
         return NGX_ERROR;
     }
 
-    tail_gr = ngx_strchr(gr, ',');
-    if (tail_gr == NULL) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "http_auth_ldap: Incorrect group DN: \"%s\"", gr);
-        ctx->outcome = OUTCOME_ERROR;
-        ngx_http_auth_ldap_return_connection(ctx->c);
-        return NGX_ERROR;
-    }
-    *tail_gr = '\0';
-    tail_gr++;
-    cn_gr = gr;
+    ava = dn[0][0];
 
     if (ngx_http_auth_ldap_escape_filter(r,
             ctx->server->group_attribute_dn == 1 ? &ctx->user_dn
                                                  : &r->headers_in.user,
             &user_val) != NGX_OK)
     {
+        ldap_memfree(base);
+        ldap_dnfree(dn);
         ctx->outcome = OUTCOME_ERROR;
         ngx_http_auth_ldap_return_connection(ctx->c);
         return NGX_ERROR;
@@ -2874,58 +3038,52 @@ ngx_http_auth_ldap_check_group(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *
     ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "http_auth_ldap: Search user in group \"%V\"", &val);
 
     if (ctx->server->group_attribute.data == NULL) {
-        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "http_auth_ldap: group_attribute.data is \"%V\" so calling a failure here", ctx->server->group_attribute.data);
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+            "http_auth_ldap: a require group rule needs group_attribute, "
+            "which this server does not set");
         rc = !LDAP_SUCCESS;
     } else {
         /*
-         * cn_gr is the first relative name of the group, "cn=staff", and it
-         * goes into the filter as an assertion.  The name of the attribute
-         * is the configuration's, but the value may come from a variable, so
-         * only the value is escaped -- escaping the whole fragment would
-         * escape the equals sign that makes it an assertion.
+         * The first relative name of the group becomes the assertion.  Its
+         * attribute is the configuration's and goes in as it stands, which
+         * is why it has to be an attribute name; its value may come from a
+         * variable and is escaped.  Both come out of the parsed name, so the
+         * value is the value and not its written form: a comma a backslash
+         * holds in the configuration is a comma in the value.
          */
-        eq = (u_char *) ngx_strchr(cn_gr, '=');
-
-        if (eq == NULL) {
-            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                "http_auth_ldap: the group \"%s\" does not start with an "
-                "attribute", cn_gr);
-            ctx->outcome = OUTCOME_ERROR;
-            ngx_http_auth_ldap_return_connection(ctx->c);
-            return NGX_ERROR;
-        }
-
-        *eq = '\0';
-
-        if (ngx_http_auth_ldap_check_attribute((u_char *) cn_gr) != NGX_OK) {
-            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                "http_auth_ldap: \"%s\" is not the name of an attribute, so "
-                "the group is refused", cn_gr);
-            ctx->outcome = OUTCOME_ERROR;
-            ngx_http_auth_ldap_return_connection(ctx->c);
-            return NGX_ERROR;
-        }
-
-        gr_val.data = eq + 1;
-        gr_val.len = ngx_strlen(eq + 1);
+        gr_val.data = (u_char *) ava->la_value.bv_val;
+        gr_val.len = ava->la_value.bv_len;
 
         if (ngx_http_auth_ldap_escape_filter(r, &gr_val, &gr_esc) != NGX_OK) {
+            ldap_memfree(base);
+            ldap_dnfree(dn);
             ctx->outcome = OUTCOME_ERROR;
             ngx_http_auth_ldap_return_connection(ctx->c);
             return NGX_ERROR;
         }
 
-        for_filter = ngx_strlen(cn_gr) + gr_esc.len + ctx->server->group_attribute.len + user_val.len + ngx_strlen("(&(=)(=))") + 1;
-        filter = ngx_pcalloc(
-            r->pool,
-            for_filter);
-        ngx_sprintf(filter, "(&(%s=%V)(%s=%V))", cn_gr, &gr_esc,
+        for_filter = ava->la_attr.bv_len + gr_esc.len + ctx->server->group_attribute.len +
+            user_val.len + ngx_strlen("(&(=)(=))") + 1;
+        filter = ngx_pcalloc(r->pool, for_filter);
+        if (filter == NULL) {
+            ldap_memfree(base);
+            ldap_dnfree(dn);
+            ctx->outcome = OUTCOME_ERROR;
+            ngx_http_auth_ldap_return_connection(ctx->c);
+            return NGX_ERROR;
+        }
+
+        ngx_sprintf(filter, "(&(%s=%V)(%s=%V))", ava->la_attr.bv_val, &gr_esc,
             ctx->server->group_attribute.data, &user_val);
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "http_auth_ldap: Search group filter is \"%s\"", (const char *) filter);
         attrs[0] = LDAP_NO_ATTRS;
         attrs[1] = NULL;
-        rc = ldap_search_ext(ctx->c->ld, tail_gr, LDAP_SCOPE_ONELEVEL, (const char *) filter, attrs, 0, NULL, NULL, NULL, 0, &ctx->c->msgid);
+        rc = ldap_search_ext(ctx->c->ld, base, LDAP_SCOPE_ONELEVEL, (const char *) filter, attrs, 0, NULL, NULL, NULL, 0, &ctx->c->msgid);
     }
+
+    ldap_memfree(base);
+    ldap_dnfree(dn);
+
     if (rc != LDAP_SUCCESS) {
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "http_auth_ldap: ldap_search_ext() failed (%d: %s)",
             rc, ldap_err2string(rc));

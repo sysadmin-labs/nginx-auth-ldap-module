@@ -112,13 +112,14 @@ code() { curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$@" || echo 000; }
 # seconds by default, and is then answered 500: the module could not decide,
 # which is not the same as a wrong password.  That wait is why these two
 # cases get a longer leash than the rest.
-refused() { curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$@" || echo 000; }
+refused() { curl -s -o /dev/null -w '%{http_code}' --max-time "${LDAPS_TMO:-25}" "$@" || echo 000; }
 
 # --- the three cases that share one nginx, and so one certificate store
 {
 	server_block off      127.0.0.1 off "";
 	server_block byname   localhost on  "$CA";
 	server_block byaddr   127.0.0.1 on  "$CA";
+	server_block systemca localhost on  "";
 } > "$WORK/blocks"
 cat > "$WORK/locations" <<'LOC'
 
@@ -139,6 +140,12 @@ cat > "$WORK/locations" <<'LOC'
             auth_ldap_servers byaddr;
             alias ROOT/t.txt;
         }
+
+        location = /systemca.txt {
+            auth_ldap "systemca";
+            auth_ldap_servers systemca;
+            alias ROOT/t.txt;
+        }
 LOC
 sed -i "s|ROOT|$WORK/html|g" "$WORK/locations"
 write_conf "$WORK/conf/trusted.conf" "$WORK/logs/trusted.log"
@@ -153,6 +160,17 @@ echo "== on, trusted ca, reached under the name in the certificate"
 out=$(code -u alice:alicepw "http://127.0.0.1:$PORT/byname.txt")
 echo "  $out"
 [ "$out" = 200 ] || note "a certificate that verifies has to be accepted, got $out"
+
+echo "== the ca one server names is not the ca of the next"
+# This server verifies against the store of the system, where the ca of the
+# test directory is not.  It shares the SSL context of the whole
+# configuration with the server above, which has just named that ca: loaded
+# into the context, it would be the store of this server too, and a
+# directory nobody told this server to trust would be accepted.
+out=$(refused -u alice:alicepw "http://127.0.0.1:$PORT/systemca.txt")
+echo "  $out"
+[ "$out" = 500 ] ||
+	note "a server with no ca of its own accepted the one another server named, got $out"
 
 echo "== on, trusted ca, reached under an address the certificate does not name"
 out=$(refused -u alice:alicepw "http://127.0.0.1:$PORT/byaddr.txt")

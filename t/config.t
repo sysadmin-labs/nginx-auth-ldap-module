@@ -119,3 +119,19 @@ Incorrect value for auth_ldap_satisfy
 --- must_die
 --- error_log
 No user attribute specified
+
+
+
+=== TEST 8: a url that names no host is refused
+--- http_config
+    ldap_server good {
+        url ldap:///ou=people,dc=test,dc=local?uid?sub?(objectClass=*);
+        require valid_user;
+    }
+--- config
+    location = /t {
+        return 200 ok;
+    }
+--- must_die
+--- error_log
+names no host
