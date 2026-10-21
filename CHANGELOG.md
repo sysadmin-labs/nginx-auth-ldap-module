@@ -70,7 +70,9 @@ upstream's own, whose single tag is `v0.1`.
   which the module then bound with the password it was handed: whoever held
   one valid password could authenticate under any name, and a group
   requirement went the same way.  Reported upstream in June 2020 and open
-  there since (pull request 239, onovy).
+  there since (pull request 239, onovy), whose title gives this the number
+  CVE-2020-14013 -- an id no register carries: the NVD returns nothing for
+  it and MITRE answers `CVE_RECORD_DNE`.
 - A connection that was already established when `ngx_event_connect_peer()`
   returned left the module waiting for a write event that nginx does not
   register in that case, so the connection never became usable and every
