@@ -14,3 +14,8 @@
 # produce them at all.  The entry therefore comes out again as soon as the
 # shipped stable line no longer carries it.
 nonnull-attribute:ngx_pstrdup
+
+# Only clang's UBSan reads this file; the libubsan of gcc has no
+# suppressions option at all.  The workflow therefore filters the same
+# finding out of its verdict by hand, and this file stays the one place that
+# says which finding it is and why.

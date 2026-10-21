@@ -67,8 +67,16 @@ jobs:
 
       - name: No findings allowed
         run: |
-          if grep -nE "AddressSanitizer|runtime error:" sanitizer.log; then
+          # ngx_pstrdup copies a null prefix of length zero while nginx
+          # starts, before a module is loaded; ci/ubsan.suppress says why
+          # that is nginx's and not ours.  gcc's libubsan cannot read a
+          # suppression file, so the one finding is taken out here.
+          grep -nE "AddressSanitizer|runtime error:" sanitizer.log |
+            grep -v 'src/core/ngx_string.c:84' > findings.txt || true
+
+          if [ -s findings.txt ]; then
+            cat findings.txt >&2
             echo "a sanitizer reported the lines above" >&2
             exit 1
           fi
-          echo "the sanitizers found nothing"
+          echo "the sanitizers found nothing but the one that is written down"
