@@ -102,6 +102,13 @@ Inside the block:
 Every one of them takes a value, and a line the block does not know is
 refused rather than dropped.
 
+`ssl_ca_dir` is read the way OpenSSL reads a directory of authorities, by
+hash, so the directory needs the symbolic links `c_rehash` leaves behind; a
+directory of certificates without them trusts nothing.  And
+`ssl_check_cert on` needs an nginx built against OpenSSL 1.0.2 or newer,
+where `X509_check_host()` is: against an older one the configuration is
+refused rather than started with the check turned off.
+
 ### `auth_ldap`
 
 **syntax:** `auth_ldap <realm> | off`
