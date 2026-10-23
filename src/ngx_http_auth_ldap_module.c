@@ -2616,6 +2616,11 @@ ngx_http_auth_ldap_handler(ngx_http_request_t *r)
 
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "http_auth_ldap: Username is \"%V\"",
             &r->headers_in.user);
+        if (r->headers_in.user.len == 0)
+        {
+            ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "http_auth_ldap: Username is empty");
+            return ngx_http_auth_ldap_set_realm(r, &alcf->realm);
+        }
         if (r->headers_in.passwd.len == 0)
         {
             ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "http_auth_ldap: Password is empty");
