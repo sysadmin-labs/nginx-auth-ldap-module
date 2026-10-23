@@ -310,6 +310,7 @@ static void ngx_http_auth_ldap_exit_worker(ngx_cycle_t *cycle);
 static ngx_int_t ngx_http_auth_ldap_init(ngx_conf_t *cf);
 static ngx_int_t ngx_http_auth_ldap_init_cache(ngx_cycle_t *cycle);
 static void ngx_http_auth_ldap_close_connection(ngx_http_auth_ldap_connection_t *c);
+static void ngx_http_auth_ldap_request_cleanup(void *data);
 static void ngx_http_auth_ldap_connect(ngx_http_auth_ldap_connection_t *c);
 static void ngx_http_auth_ldap_read_handler(ngx_event_t *rev);
 static void ngx_http_auth_ldap_reconnect_handler(ngx_event_t *);
@@ -1741,6 +1742,14 @@ ngx_http_auth_ldap_return_connection(ngx_http_auth_ldap_connection_t *c)
     if (!ngx_queue_empty(&c->server->waiting_requests)) {
         q = ngx_queue_last(&c->server->waiting_requests);
         ngx_queue_remove(q);
+        /*
+         * ngx_queue_remove() leaves the node pointing at its former
+         * neighbours unless nginx was built with --with-debug, so the node
+         * is put back into the empty state it had before it was linked.
+         * The request cleanup below reads it to decide whether it still
+         * has to unlink anything.
+         */
+        ngx_queue_init(q);
         ngx_http_auth_ldap_wake_request((ngx_queue_data(q, ngx_http_auth_ldap_ctx_t, queue))->r);
     }
 }
@@ -2517,6 +2526,29 @@ ngx_http_auth_ldap_set_realm(ngx_http_request_t *r, ngx_str_t *realm)
     return NGX_HTTP_UNAUTHORIZED;
 }
 
+/*
+ * Runs when the request pool is destroyed, a client that goes away in the
+ * middle of an authentication included.  Without it the connection the
+ * request holds is never given back, and the queue node the ctx carries
+ * stays linked into the server's waiting_requests while the memory behind
+ * it is gone: the next return_connection() walks into it and wakes a
+ * request that no longer exists.
+ */
+static void
+ngx_http_auth_ldap_request_cleanup(void *data)
+{
+    ngx_http_auth_ldap_ctx_t *ctx = data;
+
+    if (ctx->c != NULL) {
+        ngx_http_auth_ldap_return_connection(ctx->c);
+    }
+
+    if (!ngx_queue_empty(&ctx->queue)) {
+        ngx_queue_remove(&ctx->queue);
+        ngx_queue_init(&ctx->queue);
+    }
+}
+
 /**
  * LDAP Authentication handler
  */
@@ -2525,6 +2557,7 @@ ngx_http_auth_ldap_handler(ngx_http_request_t *r)
 {
     ngx_http_auth_ldap_loc_conf_t *alcf;
     ngx_http_auth_ldap_ctx_t *ctx;
+    ngx_pool_cleanup_t *cleanup;
     int rc;
 
     alcf = ngx_http_get_module_loc_conf(r, ngx_http_auth_ldap_module);
@@ -2563,7 +2596,15 @@ ngx_http_auth_ldap_handler(ngx_http_request_t *r)
         }
         ctx->r = r;
         /* Other fields have been initialized to zero/NULL */
+        ngx_queue_init(&ctx->queue);
         ngx_http_set_ctx(r, ctx, ngx_http_auth_ldap_module);
+
+        cleanup = ngx_pool_cleanup_add(r->pool, 0);
+        if (cleanup == NULL) {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+        cleanup->handler = ngx_http_auth_ldap_request_cleanup;
+        cleanup->data = ctx;
     }
 
     rc = ngx_http_auth_ldap_authenticate(r, ctx, alcf);
@@ -2600,9 +2641,9 @@ ngx_http_auth_ldap_authenticate(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t 
             ngx_http_auth_ldap_return_connection(ctx->c);
         }
 
-        // Remove ctx from waiting_requests queue if it was added.
-        if (ngx_queue_next(&ctx->queue)) {
+        if (!ngx_queue_empty(&ctx->queue)) {
             ngx_queue_remove(&ctx->queue);
+            ngx_queue_init(&ctx->queue);
         }
 
         return NGX_ERROR;
