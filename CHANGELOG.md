@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.2.4 (2026-10-24)
+
+Four defects reported by Raivo Hool, who has been carrying patches for
+this module in his own tree for years.  His commits are rebuilt against
+this fork, which had moved too far for them to apply.
+
+### Fixed
+
+- A client that went away in the middle of an authentication left its
+  request linked into the server's waiting queue and the LDAP connection
+  it held was never given back.  The next connection returned to the pool
+  walked into that node and woke a request whose pool was gone.  A pool
+  cleanup handler now returns the connection and unlinks the node.
+- `request_timeout` was armed on the client connection's write event,
+  whose handler belongs to nginx core, so it was noticed only when the
+  phase handler happened to re-enter.  It is a timer of its own now.
+- An empty user name went into the LDAP search, where it produces a
+  filter matching an entry whose attribute is empty.  It is answered with
+  401, as an empty password already was.
+- `auth_ldap_cache_size` above 8872 entries was silently reduced to that.
+  The bucket table reaches 32632 entries now, and a size that still does
+  not fit is reported instead of being capped without a word.
+
 ## v0.2.3 (2026-10-21)
 
 ### Changed
