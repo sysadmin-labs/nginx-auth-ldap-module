@@ -227,6 +227,7 @@ typedef struct {
 
     struct ngx_http_auth_ldap_connection *c;
     ngx_queue_t queue;
+    ngx_event_t timer;
     int replied;
     int error_code;
     ngx_str_t error_msg;
@@ -310,6 +311,7 @@ static void ngx_http_auth_ldap_exit_worker(ngx_cycle_t *cycle);
 static ngx_int_t ngx_http_auth_ldap_init(ngx_conf_t *cf);
 static ngx_int_t ngx_http_auth_ldap_init_cache(ngx_cycle_t *cycle);
 static void ngx_http_auth_ldap_close_connection(ngx_http_auth_ldap_connection_t *c);
+static void ngx_http_auth_ldap_request_timer_handler(ngx_event_t *ev);
 static void ngx_http_auth_ldap_request_cleanup(void *data);
 static void ngx_http_auth_ldap_connect(ngx_http_auth_ldap_connection_t *c);
 static void ngx_http_auth_ldap_read_handler(ngx_event_t *rev);
@@ -2527,6 +2529,32 @@ ngx_http_auth_ldap_set_realm(ngx_http_request_t *r, ngx_str_t *realm)
 }
 
 /*
+ * The authentication as a whole ran out of time.  The timer this belongs
+ * to lives in the request pool, so the cleanup below deletes it if the
+ * request is finalized first.
+ */
+static void
+ngx_http_auth_ldap_request_timer_handler(ngx_event_t *ev)
+{
+    ngx_http_auth_ldap_ctx_t *ctx = ev->data;
+    ngx_http_request_t *r = ctx->r;
+
+    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+        "http_auth_ldap: Authentication timed out");
+
+    if (ctx->c != NULL) {
+        ngx_http_auth_ldap_return_connection(ctx->c);
+    }
+
+    if (!ngx_queue_empty(&ctx->queue)) {
+        ngx_queue_remove(&ctx->queue);
+        ngx_queue_init(&ctx->queue);
+    }
+
+    ngx_http_finalize_request(r, NGX_HTTP_GATEWAY_TIME_OUT);
+}
+
+/*
  * Runs when the request pool is destroyed, a client that goes away in the
  * middle of an authentication included.  Without it the connection the
  * request holds is never given back, and the queue node the ctx carries
@@ -2538,6 +2566,10 @@ static void
 ngx_http_auth_ldap_request_cleanup(void *data)
 {
     ngx_http_auth_ldap_ctx_t *ctx = data;
+
+    if (ctx->timer.timer_set) {
+        ngx_del_timer(&ctx->timer);
+    }
 
     if (ctx->c != NULL) {
         ngx_http_auth_ldap_return_connection(ctx->c);
@@ -2596,6 +2628,9 @@ ngx_http_auth_ldap_handler(ngx_http_request_t *r)
         }
         ctx->r = r;
         /* Other fields have been initialized to zero/NULL */
+        ctx->timer.handler = ngx_http_auth_ldap_request_timer_handler;
+        ctx->timer.log = r->connection->log;
+        ctx->timer.data = ctx;
         ngx_queue_init(&ctx->queue);
         ngx_http_set_ctx(r, ctx, ngx_http_auth_ldap_module);
 
@@ -2672,7 +2707,7 @@ ngx_http_auth_ldap_authenticate(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t 
                 ctx->server = ((ngx_http_auth_ldap_server_t **) conf->servers->elts)[ctx->server_index];
                 ctx->outcome = OUTCOME_UNCERTAIN;
 
-                ngx_add_timer(r->connection->write, ctx->server->request_timeout);
+                ngx_add_timer(&ctx->timer, ctx->server->request_timeout);
                 ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "http_auth_ldap: request_timeout=%d",ctx->server->request_timeout);
 
 
@@ -2725,7 +2760,7 @@ ngx_http_auth_ldap_authenticate(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t 
                         continue;
                     }
                     if (rc != NGX_OK) {
-                        ngx_del_timer(r->connection->write);
+                        ngx_del_timer(&ctx->timer);
                         return NGX_ERROR;
                     }
                     ctx->phase = PHASE_CHECK_USER;
@@ -2850,8 +2885,8 @@ ngx_http_auth_ldap_authenticate(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t 
                 break;
 
             case PHASE_NEXT:
-                if (r->connection->write->timer_set) {
-                    ngx_del_timer(r->connection->write);
+                if (ctx->timer.timer_set) {
+                    ngx_del_timer(&ctx->timer);
                 }
 
                 if (ctx->c != NULL) {
