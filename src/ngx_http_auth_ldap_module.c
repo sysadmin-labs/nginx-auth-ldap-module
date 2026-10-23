@@ -2560,7 +2560,15 @@ ngx_http_auth_ldap_request_timer_handler(ngx_event_t *ev)
         ngx_queue_init(&ctx->queue);
     }
 
-    ngx_http_finalize_request(r, NGX_HTTP_GATEWAY_TIME_OUT);
+    /*
+     * The timer fires for a directory that is slow as well as for one that
+     * will never answer at all: a certificate this module refuses, a name
+     * that resolves to an address nothing listens on.  From in here the two
+     * cannot be told apart, and the second kind is what the gates actually
+     * produce, so the answer stays the 500 this module has always given for
+     * "cannot decide" rather than claiming a gateway timeout.
+     */
+    ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
 }
 
 /*
