@@ -1386,7 +1386,10 @@ ngx_http_auth_ldap_init_cache(ngx_cycle_t *cycle)
     ngx_http_auth_ldap_cache_t *cache;
     static const uint16_t primes[] = {
         13, 53, 101, 151, 199, 263, 317, 383, 443, 503,
-        577, 641, 701, 769, 839, 911, 983, 1049, 1109
+        577, 641, 701, 769, 839, 911, 983, 1049, 1109,
+        1291, 1361, 1493, 1559, 1667, 1871, 1931, 2083,
+        2297, 2411, 2593, 2791, 2999, 3181, 3361, 3557,
+        3739, 3917, 4079
     };
 
     conf = (ngx_http_auth_ldap_main_conf_t *) ngx_http_cycle_get_module_main_conf(cycle, ngx_http_auth_ldap_module);
@@ -1401,6 +1404,12 @@ ngx_http_auth_ldap_init_cache(ngx_cycle_t *cycle)
         if (count >= want) {
             break;
         }
+    }
+
+    if (count < want) {
+        ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
+            "http_auth_ldap: auth_ldap_cache_size is larger than this "
+            "module can hold, caching at most %ui entries", count * 8);
     }
 
     cache = &ngx_http_auth_ldap_cache;
