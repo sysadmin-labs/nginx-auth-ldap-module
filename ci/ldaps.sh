@@ -172,7 +172,8 @@ cat > "$WORK/locations" <<'LOC'
             alias ROOT/t.txt;
         }
 LOC
-sed -i "s|ROOT|$WORK/html|g" "$WORK/locations"
+sed "s|ROOT|$WORK/html|g" "$WORK/locations" > "$WORK/locations.new"
+mv "$WORK/locations.new" "$WORK/locations"
 write_conf "$WORK/conf/trusted.conf" "$WORK/logs/trusted.log"
 start "$WORK/conf/trusted.conf"
 
@@ -243,7 +244,8 @@ cat > "$WORK/locations" <<'LOC'
             alias ROOT/t.txt;
         }
 LOC
-sed -i "s|ROOT|$WORK/html|g" "$WORK/locations"
+sed "s|ROOT|$WORK/html|g" "$WORK/locations" > "$WORK/locations.new"
+mv "$WORK/locations.new" "$WORK/locations"
 write_conf "$WORK/conf/untrusted.conf" "$WORK/logs/untrusted.log"
 start "$WORK/conf/untrusted.conf"
 
