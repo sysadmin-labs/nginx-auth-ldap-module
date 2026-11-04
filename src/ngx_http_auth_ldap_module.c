@@ -81,6 +81,14 @@ typedef struct {
     ngx_str_t group_attribute;
     ngx_flag_t group_attribute_dn;
 
+    /*
+     * A search filter of one's own, in which the token "$remote_user" stands
+     * for the login, escaped for a filter.  It replaces the filter the url
+     * builds from a single attribute, so a login may be found by any of
+     * several attributes.  Empty when the url's attribute is used.
+     */
+    ngx_str_t user_filter;
+
     ngx_uint_t ssl_check_cert;
     ngx_str_t ssl_ca_dir;
     ngx_str_t ssl_ca_file;
@@ -309,6 +317,8 @@ static char * ngx_http_auth_ldap_read_secret_file(ngx_conf_t *cf,
     ngx_str_t *name, ngx_str_t *out);
 static ngx_str_t ngx_http_auth_ldap_log_safe(ngx_http_request_t *r,
     ngx_str_t *in);
+static u_char * ngx_http_auth_ldap_expand_user_filter(ngx_http_request_t *r,
+    ngx_str_t *tmpl, ngx_str_t *user);
 static void * ngx_http_auth_ldap_create_main_conf(ngx_conf_t *cf);
 static char * ngx_http_auth_ldap_init_main_conf(ngx_conf_t *cf, void *parent);
 static void * ngx_http_auth_ldap_create_loc_conf(ngx_conf_t *);
@@ -674,6 +684,8 @@ ngx_http_auth_ldap_ldap_server(ngx_conf_t *cf, ngx_command_t *dummy, void *conf)
     } else if (ngx_strcmp(value[0].data, "binddn_passwd_file") == 0) {
         return ngx_http_auth_ldap_read_secret_file(cf, &value[1],
             &server->bind_dn_passwd);
+    } else if (ngx_strcmp(value[0].data, "user_filter") == 0) {
+        server->user_filter = value[1];
     } else if (ngx_strcmp(value[0].data, "group_attribute") == 0) {
         server->group_attribute = value[1];
     } else if (ngx_strcmp(value[0].data, "group_attribute_is_dn") == 0) {
@@ -3161,6 +3173,52 @@ ngx_http_auth_ldap_authenticate(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t 
     }
 }
 
+/*
+ * Build a search filter from a user_filter template by putting the login,
+ * already escaped for a filter, in the place of every "$remote_user".  No
+ * other variable is read: the one moving part is the login, and it is
+ * escaped, so it cannot change the shape of the filter.
+ */
+static u_char *
+ngx_http_auth_ldap_expand_user_filter(ngx_http_request_t *r, ngx_str_t *tmpl,
+    ngx_str_t *user)
+{
+    static u_char  tok[] = "$remote_user";
+    size_t         toklen = sizeof(tok) - 1;
+    size_t         i, n = 0, len;
+    u_char        *out, *p;
+
+    for (i = 0; i + toklen <= tmpl->len; ) {
+        if (ngx_strncmp(tmpl->data + i, tok, toklen) == 0) {
+            n++;
+            i += toklen;
+        } else {
+            i++;
+        }
+    }
+
+    len = tmpl->len + n * user->len - n * toklen;
+    out = ngx_pnalloc(r->pool, len + 1);
+    if (out == NULL) {
+        return NULL;
+    }
+
+    p = out;
+    for (i = 0; i < tmpl->len; ) {
+        if (i + toklen <= tmpl->len
+            && ngx_strncmp(tmpl->data + i, tok, toklen) == 0)
+        {
+            p = ngx_cpymem(p, user->data, user->len);
+            i += toklen;
+        } else {
+            *p++ = tmpl->data[i++];
+        }
+    }
+    *p = '\0';
+
+    return out;
+}
+
 static ngx_int_t
 ngx_http_auth_ldap_search(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *ctx)
 {
@@ -3186,18 +3244,30 @@ ngx_http_auth_ldap_search(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *ctx)
             return NGX_ERROR;
         }
 
-        filter = ngx_pcalloc(
-            r->pool,
-            (ludpp->lud_filter != NULL ? ngx_strlen(ludpp->lud_filter) : ngx_strlen("(objectClass=*)")) +
-            ngx_strlen("(&(=))") + ngx_strlen(ludpp->lud_attrs[0]) + user.len + 1);
+        if (ctx->server->user_filter.len > 0) {
+            /*
+             * A filter of the server's own, with the escaped login in the
+             * place of every "$remote_user".  The url's attribute is not
+             * used, so a login can be looked up by any of several of them.
+             */
+            filter = ngx_http_auth_ldap_expand_user_filter(r,
+                &ctx->server->user_filter, &user);
+        } else {
+            filter = ngx_pcalloc(
+                r->pool,
+                (ludpp->lud_filter != NULL ? ngx_strlen(ludpp->lud_filter) : ngx_strlen("(objectClass=*)")) +
+                ngx_strlen("(&(=))") + ngx_strlen(ludpp->lud_attrs[0]) + user.len + 1);
+            if (filter != NULL) {
+                ngx_sprintf(filter, "(&%s(%s=%V))%Z",
+                        ludpp->lud_filter != NULL ? ludpp->lud_filter : "(objectClass=*)",
+                        ludpp->lud_attrs[0], &user);
+            }
+        }
         if (filter == NULL) {
             ctx->outcome = OUTCOME_ERROR;
             ngx_http_auth_ldap_return_connection(ctx->c);
             return NGX_ERROR;
         }
-        ngx_sprintf(filter, "(&%s(%s=%V))%Z",
-                ludpp->lud_filter != NULL ? ludpp->lud_filter : "(objectClass=*)",
-                ludpp->lud_attrs[0], &user);
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "http_auth_ldap: Search filter is \"%s\"",
             (const char *) filter);
 
