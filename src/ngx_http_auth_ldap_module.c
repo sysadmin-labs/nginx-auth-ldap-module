@@ -304,6 +304,8 @@ static ngx_int_t ngx_http_auth_ldap_escape_filter(ngx_http_request_t *r,
     ngx_str_t *in, ngx_str_t *out);
 static char * ngx_http_auth_ldap_read_secret_file(ngx_conf_t *cf,
     ngx_str_t *name, ngx_str_t *out);
+static ngx_str_t ngx_http_auth_ldap_log_safe(ngx_http_request_t *r,
+    ngx_str_t *in);
 static void * ngx_http_auth_ldap_create_main_conf(ngx_conf_t *cf);
 static char * ngx_http_auth_ldap_init_main_conf(ngx_conf_t *cf, void *parent);
 static void * ngx_http_auth_ldap_create_loc_conf(ngx_conf_t *);
@@ -586,6 +588,53 @@ failed:
 
     (void) ngx_close_file(file.fd);
     return NGX_CONF_ERROR;
+}
+
+/*
+ * A copy of a value safe to put in a log line.  A login is whatever the
+ * client sent, so a byte that is not printable becomes "\xHH": a newline in
+ * it cannot forge a second log line, and an escape cannot move a terminal
+ * that tails the log.  The backslash is escaped too, so the result reads
+ * back without doubt.  Allocated in the request pool, for the log line it is
+ * built for.
+ */
+static ngx_str_t
+ngx_http_auth_ldap_log_safe(ngx_http_request_t *r, ngx_str_t *in)
+{
+    static u_char  hex[] = "0123456789abcdef";
+    ngx_str_t      out;
+    u_char        *p, c;
+    size_t         i, extra = 0;
+
+    for (i = 0; i < in->len; i++) {
+        c = in->data[i];
+        if (c < 0x20 || c == 0x7f || c == '\\') {
+            extra += 3;
+        }
+    }
+
+    out.data = ngx_pnalloc(r->pool, in->len + extra + 1);
+    if (out.data == NULL) {
+        ngx_str_set(&out, "");
+        return out;
+    }
+
+    p = out.data;
+    for (i = 0; i < in->len; i++) {
+        c = in->data[i];
+        if (c < 0x20 || c == 0x7f || c == '\\') {
+            *p++ = '\\';
+            *p++ = 'x';
+            *p++ = hex[c >> 4];
+            *p++ = hex[c & 0x0f];
+        } else {
+            *p++ = c;
+        }
+    }
+    *p = '\0';
+    out.len = p - out.data;
+
+    return out;
 }
 
 /**
@@ -3012,6 +3061,18 @@ ngx_http_auth_ldap_authenticate(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t 
 
                 ctx->server_index++;
                 if (ctx->server_index >= conf->servers->nelts) {
+                    /*
+                     * Every server has refused, so the request is denied.
+                     * One line names the login that was refused, at the
+                     * level a failed auth_basic logs at, so that a log watch
+                     * such as fail2ban can act on it.  The password is never
+                     * in it, and the login is made safe first.
+                     */
+                    ngx_str_t safe = ngx_http_auth_ldap_log_safe(r,
+                        &r->headers_in.user);
+                    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                        "http_auth_ldap: authentication denied for user "
+                        "\"%V\"", &safe);
                     return ngx_http_auth_ldap_set_realm(r, &conf->realm);
                 }
 
@@ -3087,7 +3148,10 @@ ngx_http_auth_ldap_search(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *ctx)
     }
 
     if (ctx->dn.data == NULL) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "http_auth_ldap: Could not find user DN");
+        ngx_str_t safe = ngx_http_auth_ldap_log_safe(r, &r->headers_in.user);
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+            "http_auth_ldap: no directory entry for user \"%V\" on server "
+            "\"%V\"", &safe, &ctx->server->alias);
         return NGX_ERROR;
     } else {
         ctx->user_dn.len = ngx_strlen(ctx->dn.data);
@@ -3697,7 +3761,10 @@ ngx_http_auth_ldap_check_bind(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *c
 
     /* On the second call, process the operation result */
     if (ctx->error_code != LDAP_SUCCESS) {
-        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "http_auth_ldap: User bind failed (%d: %s)",
+        ngx_str_t safe = ngx_http_auth_ldap_log_safe(r, &r->headers_in.user);
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+            "http_auth_ldap: user bind failed for \"%V\" on server \"%V\" "
+            "(%d: %s)", &safe, &ctx->server->alias,
             ctx->error_code, ldap_err2string(ctx->error_code));
         ctx->outcome = OUTCOME_DENY;
     } else {
