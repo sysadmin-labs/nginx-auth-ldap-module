@@ -176,7 +176,7 @@ typedef struct {
 } ngx_http_auth_ldap_main_conf_t;
 
 typedef struct {
-    ngx_str_t realm;
+    ngx_http_complex_value_t *realm;
     ngx_array_t *servers;       /* array of ngx_http_auth_ldap_server_t* */
 } ngx_http_auth_ldap_loc_conf_t;
 
@@ -234,6 +234,9 @@ typedef struct {
     ngx_str_t dn;
     ngx_str_t user_dn;
     ngx_str_t group_dn;
+
+    /* the WWW-Authenticate value for this request, evaluated once */
+    ngx_str_t realm;
 
     ngx_http_auth_ldap_cache_key_t cache_key;
 } ngx_http_auth_ldap_ctx_t;
@@ -766,24 +769,32 @@ ngx_http_auth_ldap_ldap_server(ngx_conf_t *cf, ngx_command_t *dummy, void *conf)
 static char *
 ngx_http_auth_ldap(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
-    ngx_str_t *value = cf->args->elts;
-    ngx_http_auth_ldap_loc_conf_t *cnf = conf;
-    u_char *p;
+    ngx_http_auth_ldap_loc_conf_t    *cnf = conf;
+    ngx_str_t                        *value = cf->args->elts;
+    ngx_http_compile_complex_value_t  ccv;
+    ngx_http_complex_value_t         *cv;
 
-    if (ngx_strcmp(value[1].data, "off") == 0) {
-        ngx_str_set(&cnf->realm, "");
-        return NGX_CONF_OK;
-    }
-
-    cnf->realm.len = sizeof("Basic realm=\"") - 1 + value[1].len + 1;
-    cnf->realm.data = ngx_pcalloc(cf->pool, cnf->realm.len);
-    if (cnf->realm.data == NULL) {
+    /*
+     * The realm is kept as a complex value and evaluated for every request,
+     * so it may hold variables.  A value of "off", or one that comes out
+     * empty, turns the check off for that request, the way "auth_basic off"
+     * does: a map or a geo can then let some clients through without an if.
+     */
+    cv = ngx_palloc(cf->pool, sizeof(ngx_http_complex_value_t));
+    if (cv == NULL) {
         return NGX_CONF_ERROR;
     }
 
-    p = ngx_cpymem(cnf->realm.data, "Basic realm=\"", sizeof("Basic realm=\"") - 1);
-    p = ngx_cpymem(p, value[1].data, value[1].len);
-    *p = '"';
+    ngx_memzero(&ccv, sizeof(ngx_http_compile_complex_value_t));
+    ccv.cf = cf;
+    ccv.value = &value[1];
+    ccv.complex_value = cv;
+
+    if (ngx_http_compile_complex_value(&ccv) != NGX_OK) {
+        return NGX_CONF_ERROR;
+    }
+
+    cnf->realm = cv;
 
     return NGX_CONF_OK;
 }
@@ -1414,7 +1425,7 @@ ngx_http_auth_ldap_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     ngx_http_auth_ldap_loc_conf_t *prev = parent;
     ngx_http_auth_ldap_loc_conf_t *conf = child;
 
-    if (conf->realm.data == NULL) {
+    if (conf->realm == NULL) {
         conf->realm = prev->realm;
     }
     ngx_conf_merge_ptr_value(conf->servers, prev->servers, NULL);
@@ -2651,6 +2662,45 @@ ngx_http_auth_ldap_init_connections(ngx_cycle_t *cycle)
 
 /*** Per-request authentication processing ***/
 
+/*
+ * Build the WWW-Authenticate value from the realm the configuration gave,
+ * which may hold variables and is evaluated per request.  A quote or a
+ * backslash in it is escaped, so a realm that carries one cannot break out
+ * of the quoted string the header is.
+ */
+static ngx_int_t
+ngx_http_auth_ldap_build_realm(ngx_http_request_t *r, ngx_str_t *value,
+    ngx_str_t *out)
+{
+    size_t   i, extra = 0;
+    u_char  *p, c;
+
+    for (i = 0; i < value->len; i++) {
+        if (value->data[i] == '"' || value->data[i] == '\\') {
+            extra++;
+        }
+    }
+
+    p = ngx_pnalloc(r->pool, sizeof("Basic realm=\"\"") - 1 + value->len + extra);
+    if (p == NULL) {
+        return NGX_ERROR;
+    }
+
+    out->data = p;
+    p = ngx_cpymem(p, "Basic realm=\"", sizeof("Basic realm=\"") - 1);
+    for (i = 0; i < value->len; i++) {
+        c = value->data[i];
+        if (c == '"' || c == '\\') {
+            *p++ = '\\';
+        }
+        *p++ = c;
+    }
+    *p++ = '"';
+    out->len = p - out->data;
+
+    return NGX_OK;
+}
+
 /**
  * Respond with "401 Unauthorized" and the WWW-Authenticate header
  */
@@ -2741,25 +2791,53 @@ ngx_http_auth_ldap_handler(ngx_http_request_t *r)
     ngx_http_auth_ldap_loc_conf_t *alcf;
     ngx_http_auth_ldap_ctx_t *ctx;
     ngx_pool_cleanup_t *cleanup;
+    ngx_str_t realm;
     int rc;
 
     alcf = ngx_http_get_module_loc_conf(r, ngx_http_auth_ldap_module);
-    if (alcf->realm.len == 0) {
+    if (alcf->realm == NULL) {
         return NGX_DECLINED;
+    }
+
+    ctx = ngx_http_get_module_ctx(r, ngx_http_auth_ldap_module);
+
+    /*
+     * The realm is evaluated once, when the request is first seen, and kept
+     * on its context: the handler is re-entered while the directory is
+     * asked, and a variable in the realm must not be read again each time.
+     * A realm of "off" or one that comes out empty turns the check off for
+     * this request.
+     */
+    if (ctx != NULL) {
+        realm = ctx->realm;
+    } else {
+        ngx_str_t realm_value;
+
+        if (ngx_http_complex_value(r, alcf->realm, &realm_value) != NGX_OK) {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
+        if (realm_value.len == 0 ||
+            (realm_value.len == 3
+             && ngx_strncasecmp(realm_value.data, (u_char *) "off", 3) == 0))
+        {
+            return NGX_DECLINED;
+        }
+        if (ngx_http_auth_ldap_build_realm(r, &realm_value, &realm) != NGX_OK) {
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        }
     }
 
     if (alcf->servers == NULL || alcf->servers->nelts == 0) {
         /* No LDAP servers for the location. */
         ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "http_auth_ldap: \"auth_ldap\" requires "
                       "one or more \"auth_ldap_servers\" in the same location");
-        return ngx_http_auth_ldap_set_realm(r, &alcf->realm);
+        return ngx_http_auth_ldap_set_realm(r, &realm);
     }
 
-    ctx = ngx_http_get_module_ctx(r, ngx_http_auth_ldap_module);
     if (ctx == NULL) {
         rc = ngx_http_auth_basic_user(r);
         if (rc == NGX_DECLINED) {
-            return ngx_http_auth_ldap_set_realm(r, &alcf->realm);
+            return ngx_http_auth_ldap_set_realm(r, &realm);
         }
         if (rc == NGX_ERROR) {
             return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -2770,12 +2848,12 @@ ngx_http_auth_ldap_handler(ngx_http_request_t *r)
         if (r->headers_in.user.len == 0)
         {
             ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "http_auth_ldap: Username is empty");
-            return ngx_http_auth_ldap_set_realm(r, &alcf->realm);
+            return ngx_http_auth_ldap_set_realm(r, &realm);
         }
         if (r->headers_in.passwd.len == 0)
         {
             ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "http_auth_ldap: Password is empty");
-            return ngx_http_auth_ldap_set_realm(r, &alcf->realm);
+            return ngx_http_auth_ldap_set_realm(r, &realm);
         }
 
         ctx = ngx_pcalloc(r->pool, sizeof(ngx_http_auth_ldap_ctx_t));
@@ -2783,6 +2861,7 @@ ngx_http_auth_ldap_handler(ngx_http_request_t *r)
             return NGX_HTTP_INTERNAL_SERVER_ERROR;
         }
         ctx->r = r;
+        ctx->realm = realm;
         /* Other fields have been initialized to zero/NULL */
         ctx->timer.handler = ngx_http_auth_ldap_request_timer_handler;
         ctx->timer.log = r->connection->log;
@@ -3073,7 +3152,7 @@ ngx_http_auth_ldap_authenticate(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t 
                     ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                         "http_auth_ldap: authentication denied for user "
                         "\"%V\"", &safe);
-                    return ngx_http_auth_ldap_set_realm(r, &conf->realm);
+                    return ngx_http_auth_ldap_set_realm(r, &ctx->realm);
                 }
 
                 ctx->phase = PHASE_START;
