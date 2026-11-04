@@ -302,6 +302,8 @@ static char * ngx_http_auth_ldap_parse_referral(ngx_conf_t *cf, ngx_http_auth_ld
 static void ngx_http_auth_ldap_free_urldesc(void *data);
 static ngx_int_t ngx_http_auth_ldap_escape_filter(ngx_http_request_t *r,
     ngx_str_t *in, ngx_str_t *out);
+static char * ngx_http_auth_ldap_read_secret_file(ngx_conf_t *cf,
+    ngx_str_t *name, ngx_str_t *out);
 static void * ngx_http_auth_ldap_create_main_conf(ngx_conf_t *cf);
 static char * ngx_http_auth_ldap_init_main_conf(ngx_conf_t *cf, void *parent);
 static void * ngx_http_auth_ldap_create_loc_conf(ngx_conf_t *);
@@ -506,6 +508,86 @@ if (ngx_strcmp(value[0].data, #x) == 0) { \
         } \
         server->x = _i; \
     }
+/*
+ * Read a secret, such as a bind password, from a file of its own, so that it
+ * need not stand in the configuration where everyone who may read that file
+ * sees it, but in one whose own rights can be set, such as a container
+ * secret.  The whole file is the value, less one trailing newline that an
+ * editor leaves behind: a password that truly ends in a newline cannot be
+ * kept this way.
+ */
+static char *
+ngx_http_auth_ldap_read_secret_file(ngx_conf_t *cf, ngx_str_t *name,
+    ngx_str_t *out)
+{
+    ngx_file_t       file;
+    ngx_file_info_t  fi;
+    ngx_str_t        path = *name;
+    u_char          *buf;
+    off_t            size;
+    ssize_t          n;
+
+    if (ngx_conf_full_name(cf->cycle, &path, 1) != NGX_OK) {
+        return NGX_CONF_ERROR;
+    }
+
+    ngx_memzero(&file, sizeof(ngx_file_t));
+    file.name = path;
+    file.log = cf->log;
+
+    file.fd = ngx_open_file(path.data, NGX_FILE_RDONLY, NGX_FILE_OPEN, 0);
+    if (file.fd == NGX_INVALID_FILE) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, ngx_errno,
+            "http_auth_ldap: " ngx_open_file_n " \"%V\" failed", &path);
+        return NGX_CONF_ERROR;
+    }
+
+    if (ngx_fd_info(file.fd, &fi) == NGX_FILE_ERROR) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, ngx_errno,
+            "http_auth_ldap: " ngx_fd_info_n " \"%V\" failed", &path);
+        goto failed;
+    }
+
+    size = ngx_file_size(&fi);
+    if (size < 0 || size > 65536) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+            "http_auth_ldap: \"%V\" is not a plausible size for a secret",
+            &path);
+        goto failed;
+    }
+
+    buf = ngx_pnalloc(cf->pool, (size_t) size + 1);
+    if (buf == NULL) {
+        goto failed;
+    }
+
+    n = ngx_read_file(&file, buf, (size_t) size, 0);
+    if (n == NGX_ERROR) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, ngx_errno,
+            "http_auth_ldap: " ngx_read_file_n " \"%V\" failed", &path);
+        goto failed;
+    }
+
+    if (n > 0 && buf[n - 1] == LF) {
+        n--;
+    }
+    if (n > 0 && buf[n - 1] == CR) {
+        n--;
+    }
+
+    buf[n] = '\0';
+    out->data = buf;
+    out->len = (size_t) n;
+
+    (void) ngx_close_file(file.fd);
+    return NGX_CONF_OK;
+
+failed:
+
+    (void) ngx_close_file(file.fd);
+    return NGX_CONF_ERROR;
+}
+
 /**
  * Called for every variable inside ldap_server block
  */
@@ -537,6 +619,9 @@ ngx_http_auth_ldap_ldap_server(ngx_conf_t *cf, ngx_command_t *dummy, void *conf)
         server->bind_dn = value[1];
     } else if (ngx_strcmp(value[0].data, "binddn_passwd") == 0) {
         server->bind_dn_passwd = value[1];
+    } else if (ngx_strcmp(value[0].data, "binddn_passwd_file") == 0) {
+        return ngx_http_auth_ldap_read_secret_file(cf, &value[1],
+            &server->bind_dn_passwd);
     } else if (ngx_strcmp(value[0].data, "group_attribute") == 0) {
         server->group_attribute = value[1];
     } else if (ngx_strcmp(value[0].data, "group_attribute_is_dn") == 0) {
