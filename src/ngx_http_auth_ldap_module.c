@@ -89,6 +89,13 @@ typedef struct {
      */
     ngx_str_t user_filter;
 
+    /*
+     * The attributes of the user entry to read in the search and to hand on
+     * through $ldap_attr_<name>, alongside $ldap_user_dn.  NULL when none are
+     * asked for and the search reads no attributes at all.
+     */
+    ngx_array_t *user_attributes;   /* of ngx_str_t */
+
     ngx_uint_t ssl_check_cert;
     ngx_str_t ssl_ca_dir;
     ngx_str_t ssl_ca_file;
@@ -188,6 +195,12 @@ typedef struct {
     ngx_array_t *servers;       /* array of ngx_http_auth_ldap_server_t* */
 } ngx_http_auth_ldap_loc_conf_t;
 
+/* one attribute of the user entry, as $ldap_attr_<name> gives it back */
+typedef struct {
+    ngx_str_t name;
+    ngx_str_t value;
+} ngx_http_auth_ldap_attr_t;
+
 typedef struct {
     uint32_t small_hash;     /* murmur2 hash of username ^ &server       */
     uint32_t outcome;        /* OUTCOME_DENY or OUTCOME_ALLOW            */
@@ -245,6 +258,13 @@ typedef struct {
 
     /* the WWW-Authenticate value for this request, evaluated once */
     ngx_str_t realm;
+
+    /*
+     * The attributes the search read from the user entry, for
+     * $ldap_attr_<name>.  Allocated in the request pool when the server asks
+     * for any; NULL otherwise.
+     */
+    ngx_array_t *attrs;         /* of ngx_http_auth_ldap_attr_t */
 
     ngx_http_auth_ldap_cache_key_t cache_key;
 } ngx_http_auth_ldap_ctx_t;
@@ -319,6 +339,10 @@ static ngx_str_t ngx_http_auth_ldap_log_safe(ngx_http_request_t *r,
     ngx_str_t *in);
 static u_char * ngx_http_auth_ldap_expand_user_filter(ngx_http_request_t *r,
     ngx_str_t *tmpl, ngx_str_t *user);
+static ngx_int_t ngx_http_auth_ldap_variable_user_dn(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data);
+static ngx_int_t ngx_http_auth_ldap_variable_attr(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data);
 static void * ngx_http_auth_ldap_create_main_conf(ngx_conf_t *cf);
 static char * ngx_http_auth_ldap_init_main_conf(ngx_conf_t *cf, void *parent);
 static void * ngx_http_auth_ldap_create_loc_conf(ngx_conf_t *);
@@ -686,6 +710,29 @@ ngx_http_auth_ldap_ldap_server(ngx_conf_t *cf, ngx_command_t *dummy, void *conf)
             &server->bind_dn_passwd);
     } else if (ngx_strcmp(value[0].data, "user_filter") == 0) {
         server->user_filter = value[1];
+    } else if (ngx_strcmp(value[0].data, "user_attributes") == 0) {
+        ngx_uint_t k;
+
+        if (server->user_attributes == NULL) {
+            server->user_attributes = ngx_array_create(cf->pool,
+                cf->args->nelts - 1, sizeof(ngx_str_t));
+            if (server->user_attributes == NULL) {
+                return NGX_CONF_ERROR;
+            }
+        }
+        for (k = 1; k < cf->args->nelts; k++) {
+            ngx_str_t *a = ngx_array_push(server->user_attributes);
+            if (a == NULL) {
+                return NGX_CONF_ERROR;
+            }
+            *a = value[k];
+        }
+        /*
+         * The values are read in the live search, which a cached outcome
+         * would skip, so a server that hands attributes on is answered
+         * without the cache, the way a variable rule already is.
+         */
+        server->cacheable = 0;
     } else if (ngx_strcmp(value[0].data, "group_attribute") == 0) {
         server->group_attribute = value[1];
     } else if (ngx_strcmp(value[0].data, "group_attribute_is_dn") == 0) {
@@ -1515,11 +1562,83 @@ ngx_http_auth_ldap_exit_worker(ngx_cycle_t *cycle)
 /**
  * Init module and add ldap auth handler to NGX_HTTP_ACCESS_PHASE
  */
+/*
+ * $ldap_user_dn: the DN of the user this request authenticated as, whether
+ * it was searched for or built from a template.  Not found when no auth_ldap
+ * ran, or when it did not reach a user.
+ */
+static ngx_int_t
+ngx_http_auth_ldap_variable_user_dn(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data)
+{
+    ngx_http_auth_ldap_ctx_t *ctx;
+
+    ctx = ngx_http_get_module_ctx(r, ngx_http_auth_ldap_module);
+    if (ctx == NULL || ctx->user_dn.data == NULL) {
+        v->not_found = 1;
+        return NGX_OK;
+    }
+
+    v->valid = 1;
+    v->no_cacheable = 1;
+    v->not_found = 0;
+    v->len = ctx->user_dn.len;
+    v->data = ctx->user_dn.data;
+
+    return NGX_OK;
+}
+
+/*
+ * $ldap_attr_<name>: the first value the search read for <name>, where the
+ * server was told to read it with user_attributes.  Not found when no such
+ * attribute was read.  The lookup ignores case, as attribute names do.
+ */
+static ngx_int_t
+ngx_http_auth_ldap_variable_attr(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data)
+{
+    ngx_str_t                 *name = (ngx_str_t *) data;
+    ngx_http_auth_ldap_ctx_t  *ctx;
+    ngx_http_auth_ldap_attr_t *a;
+    ngx_str_t                  want;
+    ngx_uint_t                 i;
+    size_t                     plen = sizeof("ldap_attr_") - 1;
+
+    ctx = ngx_http_get_module_ctx(r, ngx_http_auth_ldap_module);
+    if (ctx == NULL || ctx->attrs == NULL || name->len <= plen) {
+        v->not_found = 1;
+        return NGX_OK;
+    }
+
+    want.data = name->data + plen;
+    want.len = name->len - plen;
+
+    a = ctx->attrs->elts;
+    for (i = 0; i < ctx->attrs->nelts; i++) {
+        if (a[i].name.len == want.len
+            && ngx_strncasecmp(a[i].name.data, want.data, want.len) == 0)
+        {
+            v->valid = 1;
+            v->no_cacheable = 1;
+            v->not_found = 0;
+            v->len = a[i].value.len;
+            v->data = a[i].value.data;
+            return NGX_OK;
+        }
+    }
+
+    v->not_found = 1;
+    return NGX_OK;
+}
+
 static ngx_int_t
 ngx_http_auth_ldap_init(ngx_conf_t *cf)
 {
     ngx_http_handler_pt *h;
     ngx_http_core_main_conf_t *cmcf;
+    ngx_http_variable_t *var;
+    ngx_str_t name_dn = ngx_string("ldap_user_dn");
+    ngx_str_t name_attr = ngx_string("ldap_attr_");
 
     cmcf = ngx_http_conf_get_module_main_conf(cf, ngx_http_core_module);
 
@@ -1529,6 +1648,20 @@ ngx_http_auth_ldap_init(ngx_conf_t *cf)
     }
 
     *h = ngx_http_auth_ldap_handler;
+
+    var = ngx_http_add_variable(cf, &name_dn, NGX_HTTP_VAR_NOCACHEABLE);
+    if (var == NULL) {
+        return NGX_ERROR;
+    }
+    var->get_handler = ngx_http_auth_ldap_variable_user_dn;
+
+    var = ngx_http_add_variable(cf, &name_attr,
+        NGX_HTTP_VAR_PREFIX | NGX_HTTP_VAR_NOCACHEABLE);
+    if (var == NULL) {
+        return NGX_ERROR;
+    }
+    var->get_handler = ngx_http_auth_ldap_variable_attr;
+
     return NGX_OK;
 }
 
@@ -2398,6 +2531,53 @@ ngx_http_auth_ldap_read_handler(ngx_event_t *rev)
                             c->rctx->dn.data = (u_char *) ngx_palloc(c->rctx->r->pool, c->rctx->dn.len + 1);
                             ngx_memcpy(c->rctx->dn.data, dn, c->rctx->dn.len + 1);
                             ldap_memfree(dn);
+
+                            /*
+                             * Read the asked-for attributes from this same
+                             * entry, the first value of each, for
+                             * $ldap_attr_<name>.  An attribute the entry does
+                             * not carry becomes the empty string, so the
+                             * variable is always there once the user was
+                             * found.
+                             */
+                            if (c->rctx->server->user_attributes != NULL) {
+                                ngx_http_request_t *r = c->rctx->r;
+                                ngx_uint_t  na = c->rctx->server->user_attributes->nelts;
+                                ngx_str_t  *an = c->rctx->server->user_attributes->elts;
+                                ngx_uint_t  k;
+
+                                c->rctx->attrs = ngx_array_create(r->pool, na,
+                                    sizeof(ngx_http_auth_ldap_attr_t));
+                                for (k = 0; c->rctx->attrs != NULL && k < na; k++) {
+                                    struct berval **vals =
+                                        ldap_get_values_len(c->ld, result,
+                                            (char *) an[k].data);
+                                    ngx_http_auth_ldap_attr_t *pair =
+                                        ngx_array_push(c->rctx->attrs);
+
+                                    if (pair == NULL) {
+                                        if (vals != NULL) {
+                                            ldap_value_free_len(vals);
+                                        }
+                                        break;
+                                    }
+                                    pair->name = an[k];
+                                    ngx_str_set(&pair->value, "");
+                                    if (vals != NULL && vals[0] != NULL) {
+                                        pair->value.data = ngx_pnalloc(r->pool,
+                                            vals[0]->bv_len + 1);
+                                        if (pair->value.data != NULL) {
+                                            ngx_memcpy(pair->value.data,
+                                                vals[0]->bv_val, vals[0]->bv_len);
+                                            pair->value.data[vals[0]->bv_len] = '\0';
+                                            pair->value.len = vals[0]->bv_len;
+                                        }
+                                    }
+                                    if (vals != NULL) {
+                                        ldap_value_free_len(vals);
+                                    }
+                                }
+                            }
                         }
                     }
                 } else if (ldap_msgtype(result) == LDAP_RES_SEARCH_RESULT) {
@@ -3225,6 +3405,7 @@ ngx_http_auth_ldap_search(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *ctx)
     LDAPURLDesc *ludpp;
     u_char *filter;
     char *attrs[2];
+    char **attrs_p;
     ngx_int_t rc;
     ngx_str_t user;
 
@@ -3271,10 +3452,35 @@ ngx_http_auth_ldap_search(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *ctx)
         ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "http_auth_ldap: Search filter is \"%s\"",
             (const char *) filter);
 
-        attrs[0] = LDAP_NO_ATTRS;
-        attrs[1] = NULL;
+        /*
+         * With user_attributes the search asks for those attributes, so the
+         * entry it finds carries their values for $ldap_attr_<name>.
+         * Without it the search reads no attribute at all, as it only ever
+         * needed the DN.  The names come from the configuration and are
+         * NUL-terminated.
+         */
+        if (ctx->server->user_attributes != NULL) {
+            ngx_uint_t  na = ctx->server->user_attributes->nelts;
+            ngx_str_t  *an = ctx->server->user_attributes->elts;
+            ngx_uint_t  k;
 
-        rc = ldap_search_ext(ctx->c->ld, ludpp->lud_dn, ludpp->lud_scope, (const char *) filter, attrs, 0, NULL, NULL, NULL, 0, &ctx->c->msgid);
+            attrs_p = ngx_pnalloc(r->pool, (na + 1) * sizeof(char *));
+            if (attrs_p == NULL) {
+                ctx->outcome = OUTCOME_ERROR;
+                ngx_http_auth_ldap_return_connection(ctx->c);
+                return NGX_ERROR;
+            }
+            for (k = 0; k < na; k++) {
+                attrs_p[k] = (char *) an[k].data;
+            }
+            attrs_p[na] = NULL;
+        } else {
+            attrs[0] = LDAP_NO_ATTRS;
+            attrs[1] = NULL;
+            attrs_p = attrs;
+        }
+
+        rc = ldap_search_ext(ctx->c->ld, ludpp->lud_dn, ludpp->lud_scope, (const char *) filter, attrs_p, 0, NULL, NULL, NULL, 0, &ctx->c->msgid);
         if (rc != LDAP_SUCCESS) {
             ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "http_auth_ldap: ldap_search_ext() failed (%d, %s)",
                 rc, ldap_err2string(rc));
