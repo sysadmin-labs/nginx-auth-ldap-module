@@ -1,5 +1,39 @@
 # Changelog
 
+## v0.3.0 (2026-11-08)
+
+Features taken from the revived upstream and written here independently, no
+code carried over.  Where a value is escaped for a filter, it is still the
+library that escapes it.
+
+### Added
+
+- `binddn_passwd_file` reads the bind password from a file of its own, such
+  as a mounted secret, so it need not stand in the configuration where every
+  reader of that file sees it.  The file is the password, less one trailing
+  newline.
+- `auth_ldap` takes a complex value, so the realm may hold variables and is
+  evaluated per request.  A value of `off`, or one that comes out empty,
+  turns the check off for that request, the way `auth_basic off` does, so a
+  `map` or a `geo` can let some clients through without an `if`.  A quote or
+  a backslash in the realm is escaped into the header.
+- `user_filter` gives a server a search filter of its own, in which the
+  token `$remote_user` stands for the login, escaped for a filter, so a
+  login may be matched against several attributes at once, as in
+  `(|(uid=$remote_user)(mail=$remote_user))`.
+- `user_attributes` reads named attributes from the user entry and hands
+  their first value on as `$ldap_attr_<name>`, next to `$ldap_user_dn`, for
+  `proxy_set_header` and logs.  A server that exposes attributes is answered
+  without the cache, so the values always come from the entry just read.
+
+### Changed
+
+- A refused request leaves one line in the error log that names the login
+  and the server, at the level a failed `auth_basic` logs at, so a watch
+  such as fail2ban can act on it.  The password is never written, and the
+  login is escaped first, so a newline in it cannot forge a line.  The bind
+  failure and the missing-entry lines name the login and the server too.
+
 ## v0.2.4 (2026-10-24)
 
 Four defects reported by Raivo Hool, who has been carrying patches for
