@@ -1,0 +1,41 @@
+name: Features
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  schedule:
+    # Monday morning, so a new nginx release that breaks the module shows
+    # up here and not in somebody's build
+    - cron: '53 7 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  features:
+    name: the features this fork adds
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # The parser in t/ cannot reach these: a bind password from a file, a
+    # search filter of the server's own, the user DN and attributes as
+    # variables, the realm as a variable that turns the check off, and the
+    # line a refused login leaves.  A slapd answers, and the requests check
+    # what the module does with it.
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup
+        with:
+          test-nginx: 'false'
+          packages: libldap2-dev slapd ldap-utils
+
+      - name: Build nginx
+        run: |
+          . .github/versions.env
+          ci/build.sh "$NGINX_VERSION" "$HOME/nginx"
+
+      - name: Secrets, filters, variables and the denial log
+        run: ci/features.sh "$HOME/nginx/sbin/nginx"
