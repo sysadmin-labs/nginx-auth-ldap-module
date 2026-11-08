@@ -87,6 +87,9 @@ Inside the block:
 |---|---|
 | `url` | `ldap://` or `ldaps://` followed by host, port, base DN, the attribute a login name is matched against, the scope and a filter.  The host and the attribute are both required; a url without a host is refused when the configuration is read. |
 | `binddn`, `binddn_passwd` | the account the search is made with.  Without them the search is anonymous. |
+| `binddn_passwd_file` | the bind password read from a file of its own, such as a mounted secret, instead of standing in the configuration.  The file is the password, less one trailing newline. |
+| `user_filter` | a search filter of this block's own, in which the token `$remote_user` stands for the login, escaped for a filter.  It replaces the filter built from the url's attribute, so a login may be matched against several attributes, as in `(\|(uid=$remote_user)(mail=$remote_user))`. |
+| `user_attributes` | the attributes of the user entry the search reads and hands on through `$ldap_attr_<name>`.  A block that asks for any is answered without the cache. |
 | `group_attribute` | the attribute a group lists its members in, `member` or `uniqueMember` as a rule.  There is no default: a `require group` rule without it refuses every request. |
 | `group_attribute_is_dn` | `on` when that attribute holds distinguished names, `off`, the default, when it holds login names |
 | `require valid_user` | any account that binds is let in |
@@ -119,7 +122,12 @@ refused rather than started with the check turned off.
 **default:** `off`
 **context:** `http`, `server`, `location`, `limit_except`
 
-Switches the authentication on and names the realm the browser shows.
+Switches the authentication on and names the realm the browser shows.  The
+realm may hold variables and is evaluated per request: a value of `off`, or
+one that comes out empty, turns the check off for that request, the way
+`auth_basic off` does, so a `map` or a `geo` can let some clients through
+without an `if`.  A quote or a backslash in the realm is escaped into the
+header.
 
 ### `auth_ldap_servers`
 
@@ -191,7 +199,27 @@ nothing at all.  More blocks than the number work as long as every one of
 them stands before the first `auth_ldap_servers`: the array moves when it
 grows, and a location holds pointers into it.
 
+## Variables
+
+| variable | value |
+|---|---|
+| `$ldap_user_dn` | the DN of the user the request authenticated as, whether the search found it or a `require valid_user "<dn>"` template built it. |
+| `$ldap_attr_<name>` | the first value the search read for `<name>`, for a `<name>` the server's `user_attributes` lists.  An attribute the entry does not carry is the empty string; a name that was not asked for is not found. |
+
+They are set once the user has been reached and are meant for
+`proxy_set_header` and logs: a backend can be told the mail address or the
+display name of the user who logged in, or the uid of one who logged in by
+mail.  A server that exposes attributes is answered without the cache, so
+the values always come from the entry just read.
+
 ## Behaviour
+
+A refused request leaves one line in the error log that names the login and
+the server, at the level a failed `auth_basic` logs at, so that a watch such
+as fail2ban can act on it.  The password is never written, and the login is
+escaped first, so a newline or an escape in it cannot forge a line.
+
+
 
 A `require` rule may hold a variable, as in
 `require group "cn=$http_x_group,ou=groups,dc=example,dc=com"`.  The value is
