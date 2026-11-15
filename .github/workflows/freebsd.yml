@@ -44,6 +44,11 @@ jobs:
               TEST_NGINX_NO_SHUFFLE=1 \
             TEST_NGINX_BINARY="$HOME/nginx/sbin/nginx" prove -r t/
             ci/auth.sh "$HOME/nginx/sbin/nginx"
+            # the added features answer out of the same directory, and the
+            # bind password read from a file is the one of them that turns
+            # on file permissions, which differ here from what the Linux
+            # jobs see
+            ci/features.sh "$HOME/nginx/sbin/nginx"
             # This is the job the check belongs to: nginx uses kqueue here,
             # and kqueue has no add_connection, so a connect that comes back
             # connected leaves the write event unregistered.  On epoll the
@@ -56,3 +61,5 @@ jobs:
             ci/build.sh "$NGINX_VERSION" "$HOME/nginx-dyn" dynamic
             AUTH_LOAD_MODULE=$HOME/nginx-dyn/modules/ngx_http_auth_ldap_module.so \
               ci/auth.sh "$HOME/nginx-dyn/sbin/nginx"
+            AUTH_LOAD_MODULE=$HOME/nginx-dyn/modules/ngx_http_auth_ldap_module.so \
+              ci/features.sh "$HOME/nginx-dyn/sbin/nginx"
