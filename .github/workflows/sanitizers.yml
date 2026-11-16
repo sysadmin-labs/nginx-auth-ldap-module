@@ -20,17 +20,36 @@ jobs:
     timeout-minutes: 15
 
     env:
-      # nginx runs the little programs its configure compiles.  With leak
-      # detection on, each of them reports at exit and returns non-zero,
-      # and every feature probe comes out "found but is not working".  So
-      # leaks are valgrind's job here, not this job's.
-      ASAN_OPTIONS: detect_leaks=0
+      # detect_leaks=0: nginx runs the little programs its configure
+      # compiles, and with leak detection on each of them reports at exit
+      # and returns non-zero, so every feature probe comes out "found but
+      # is not working".
+      #
+      # log_path, because nginx redirects its own stderr onto the error
+      # log file and a report written to stderr would be lost there; see
+      # the findings step below.
+      #
+      # Comma separated, and log_path in the middle, both on purpose.
+      # Test::Nginx appends the name of each test block to log_path so
+      # that every block gets a file of its own, and it cuts the value out
+      # with /log_path=([^,]+)/: a colon after the path is read as part of
+      # it, and whatever option followed ends up inside the file name,
+      # which ASan rejects with "Invalid value for bool option".  That is
+      # also why abort_on_error sits here and not on the step's command
+      # line.
+      ASAN_OPTIONS: detect_leaks=0,log_path=${{ github.workspace }}/sanlog/asan,abort_on_error=0
       # ci/ubsan.suppress says which finding is nginx's own and why.  gcc's
       # libubsan cannot read a suppression file, so the verdict step below
       # takes that one finding out instead; the option is set for a clang
       # build, where it works.
-      UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=0:suppressions=${{ github.workspace }}/ci/ubsan.suppress
-      CI_CC_OPT: '-fsanitize=address,undefined -fno-omit-frame-pointer -g -O1'
+      UBSAN_OPTIONS: print_stacktrace=1,halt_on_error=0,suppressions=${{ github.workspace }}/ci/ubsan.suppress,log_path=${{ github.workspace }}/sanlog/ubsan
+      # -DNGX_DEBUG_PALLOC=1 is what makes this run able to see the thing
+      # it is for.  Without it ngx_palloc and ngx_pnalloc hand out slices
+      # of a pool block, so a write past an allocation lands inside a
+      # block ASan handed over whole and no report is made; nginx keeps a
+      # switch for exactly this and sends every allocation straight to
+      # malloc when it is set.
+      CI_CC_OPT: '-fsanitize=address,undefined -fno-omit-frame-pointer -g -O1 -DNGX_DEBUG_PALLOC=1'
       CI_LD_OPT: '-fsanitize=address,undefined'
 
     steps:
@@ -48,8 +67,8 @@ jobs:
       - name: Run the test suite under the sanitizers
         run: |
           set -o pipefail
-          ASAN_OPTIONS="$ASAN_OPTIONS:abort_on_error=0" \
-            TEST_NGINX_NO_SHUFFLE=1 \
+          mkdir -p sanlog
+          TEST_NGINX_NO_SHUFFLE=1 \
             TEST_NGINX_BINARY="$HOME/nginx/sbin/nginx" \
             prove -r t/ 2>&1 | tee sanitizer.log
 
@@ -75,20 +94,29 @@ jobs:
 
       - name: No findings allowed
         run: |
-          # ngx_pstrdup copies a null prefix of length zero while nginx
-          # starts, before a module is loaded; ci/ubsan.suppress says why
-          # that is nginx's and not ours.  gcc's libubsan cannot read a
-          # suppression file, so the one finding is taken out here -- by the
-          # whole line it prints, not by the file and line alone, so that a
-          # finding of ours that lands on the same nginx line stays in.
-          grep -nE "AddressSanitizer|LeakSanitizer|runtime error:" sanitizer.log |
-            grep -vE "ngx_string\.c:[0-9]+:[0-9]+: runtime error: null pointer passed as argument 2, which is declared to never be null" |
-            grep -vE "ngx_md5\.c:[0-9]+:[0-9]+: runtime error: load of misaligned address .* for type 'uint32_t'" \
-            > findings.txt || true
+          # Both sources, because the sanitizers write where log_path
+          # points and nginx writes its stderr to the error log file.
+          # nginx redirects stderr onto that file as soon as error_log
+          # names one, which Test::Nginx always does, so a grep over the
+          # suite's output alone saw ASan only indirectly -- through the
+          # worker dying -- and missed every UBSan report: halt_on_error
+          # keeps the process alive and "runtime error:" carries none of
+          # the levels Test::Nginx looks for.
+          cat sanitizer.log > sanfindings.txt
+          for f in sanlog/*; do
+            [ -e "$f" ] || continue
+            echo "== $f ==" >> sanfindings.txt
+            cat "$f" >> sanfindings.txt
+          done
 
-          if [ -s findings.txt ]; then
-            cat findings.txt >&2
-            echo "a sanitizer reported the lines above" >&2
+          if grep -nE "AddressSanitizer|LeakSanitizer|runtime error:" sanfindings.txt |
+            grep -vE "ngx_string\.c:[0-9]+:[0-9]+: runtime error: null pointer passed as argument 2, which is declared to never be null" |
+            grep -vE "ngx_md5\.c:[0-9]+:[0-9]+: runtime error: load of misaligned address .* for type 'uint32_t'" |
+            grep -q .
+          then
+            echo "--- everything the sanitizers wrote ---" >&2
+            cat sanfindings.txt >&2
+            echo "a sanitizer reported findings, see above" >&2
             exit 1
           fi
-          echo "the sanitizers found nothing but the one that is written down"
+          echo "the sanitizers found nothing but the ones that are written down"

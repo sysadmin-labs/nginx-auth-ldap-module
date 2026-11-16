@@ -3,6 +3,10 @@ t/servroot/
 
 # created by ci/build.sh, ci/reload.sh and the drivers under ci/
 ci-work/
+# created by the sanitizer workflow
+sanlog/
+sanitizer.log
+sanfindings.txt
 
 # leftovers from patch(1)
 *.orig
