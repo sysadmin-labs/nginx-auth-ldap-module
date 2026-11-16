@@ -93,16 +93,21 @@ jobs:
             >> sanitizer.log
 
       - name: No findings allowed
+        # Also after a failed suite, and above all then: a worker that ASan
+        # took down makes the suite fail, and the report that says why is
+        # exactly what this step prints.  Without this, the one case worth
+        # having the step for is the case where it never runs.
+        if: always()
         run: |
-          # Both sources, because the sanitizers write where log_path
-          # points and nginx writes its stderr to the error log file.
-          # nginx redirects stderr onto that file as soon as error_log
-          # names one, which Test::Nginx always does, so a grep over the
-          # suite's output alone saw ASan only indirectly -- through the
-          # worker dying -- and missed every UBSan report: halt_on_error
-          # keeps the process alive and "runtime error:" carries none of
-          # the levels Test::Nginx looks for.
-          cat sanitizer.log > sanfindings.txt
+          # Both sources.  The sanitizers write where log_path points, and
+          # nginx redirects its own stderr onto the error log file as soon
+          # as error_log names one, which Test::Nginx always does -- so a
+          # grep over the suite's output alone saw ASan only indirectly,
+          # through the worker dying, and missed every UBSan report:
+          # halt_on_error keeps the process alive and "runtime error:"
+          # carries none of the levels Test::Nginx looks for.
+          : > sanfindings.txt
+          [ -e sanitizer.log ] && cat sanitizer.log >> sanfindings.txt
           for f in sanlog/*; do
             [ -e "$f" ] || continue
             echo "== $f ==" >> sanfindings.txt
