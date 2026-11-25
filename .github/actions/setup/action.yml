@@ -34,12 +34,21 @@ runs:
         # shellcheck disable=SC2086
         "$GITHUB_WORKSPACE/ci/apt-get.sh" install -y --no-install-recommends $packages
 
+    # The cached tree holds XS objects, so it is only good for the
+    # interpreter that built them.  A new runner image brings a new Perl
+    # and the old objects then fail their handshake at load time.
+    - name: Perl build for the cache key
+      if: inputs.test-nginx == 'true'
+      id: perl
+      shell: bash
+      run: echo "id=$(perl -MConfig -e 'print "$Config{version}-$Config{archname}"')" >> "$GITHUB_OUTPUT"
+
     - name: Cache Test::Nginx
       if: inputs.test-nginx == 'true'
       uses: actions/cache@v6
       with:
         path: ~/perl5
-        key: cpan-${{ runner.os }}-test-nginx
+        key: cpan-${{ runner.os }}-${{ steps.perl.outputs.id }}-test-nginx
 
     - name: Install Test::Nginx
       if: inputs.test-nginx == 'true'

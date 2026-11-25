@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- CI: the Test::Nginx cache is now keyed by the Perl build, not just by
+  the runner OS.  When the hosted image moved to Ubuntu 26.04 the cached
+  `~/perl5` tree was restored against a new interpreter and every test
+  file died before its first assertion with `loadable library and perl
+  binaries are mismatched`, taking Build & Test, A/UBSan and Valgrind
+  down together.
+
 ## v0.3.0 (2026-11-08)
 
 Features taken from the revived upstream and written here independently, no
